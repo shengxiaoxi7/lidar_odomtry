@@ -42,6 +42,9 @@ Eigen::Matrix4d last_pose = Eigen::Matrix4d::Identity();     // 上一帧位姿
 PointCloudPtr global_map = nullptr;       // 全局地图
 Eigen::Matrix4d T_curr_last = Eigen::Matrix4d::Identity();
 
+std::deque<PointCloudPtr> local_map_frames;
+int max_local_frames;  // 最多保留帧数
+
 // 算法参数
 int max_iterations;
 double convergence_threshold;
@@ -504,6 +507,100 @@ bool CustomNdtAlign(const PointCloudPtr& source, const PointCloudPtr& target, Ei
     return true;
 }
 
+bool IsKeyframe(const Eigen::Matrix4d& last_pose, const Eigen::Matrix4d& current_pose, double trans_thresh = 0.5, double rot_thresh_deg = 10.0) {
+    Eigen::Matrix4d delta = last_pose.inverse() * current_pose;
+    double trans = delta.block<3,1>(0,3).norm();
+
+    Eigen::Matrix3d R = delta.block<3,3>(0,0);
+    double angle_rad = std::acos(std::min(1.0, std::max(-1.0, (R.trace() - 1.0) / 2.0)));
+    double angle_deg = angle_rad * 180.0 / M_PI;
+
+    return trans > trans_thresh || angle_deg > rot_thresh_deg;
+}
+
+
+// 支持局部地图匹配的 GnAlignPoint2Plane 版本
+bool GnAlignPoint2Plane_LocalMap( const PointCloudPtr& source, const std::deque<PointCloudPtr>& local_map_scans, Eigen::Matrix4d& T_output) 
+{
+    // 拼接局部地图
+    PointCloudPtr target(new PointCloudT());
+    for (const auto& scan : local_map_scans) {
+        *target += *scan;
+    }
+    if (target->empty() || source->empty()) return false;
+
+    // 法向量估计
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>());
+    pcl::NormalEstimation<PointT, pcl::Normal> ne;
+    ne.setInputCloud(target);
+    pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>());
+    ne.setSearchMethod(tree);
+    ne.setKSearch(20);
+    ne.compute(*normals);
+
+    // 建立目标点云的 KDTree
+    pcl::KdTreeFLANN<PointT>::Ptr kdtree(new pcl::KdTreeFLANN<PointT>());
+    kdtree->setInputCloud(target);
+
+    Eigen::Matrix4d T = T_output;
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Zero();
+        int effective_count = 0;
+
+        for (size_t i = 0; i < source->size(); ++i) {
+            const auto& p = source->points[i];
+            Eigen::Vector4d ps_h(p.x, p.y, p.z, 1.0);
+            Eigen::Vector3d ps = (T * ps_h).head<3>();
+
+            PointT search_point;
+            search_point.x = ps.x();
+            search_point.y = ps.y();
+            search_point.z = ps.z();
+
+            std::vector<int> indices(1);
+            std::vector<float> dists(1);
+            if (kdtree->nearestKSearch(search_point, 1, indices, dists) == 0)
+                continue;
+
+            int idx = indices[0];
+            const auto& pt = target->points[idx];
+            const auto& n = normals->points[idx];
+            Eigen::Vector3d qi(pt.x, pt.y, pt.z);
+            Eigen::Vector3d ni_raw(n.normal_x, n.normal_y, n.normal_z);
+            if (ni_raw.norm() < 1e-3) continue;
+            Eigen::Vector3d ni = ni_raw.normalized();
+
+            double r = (ps - qi).dot(ni);
+            if (std::abs(r) > 1.0) continue;
+
+            Eigen::Matrix<double, 1, 6> J;
+            J.block<1, 3>(0, 0) = -ni.transpose() * SkewSymmetric(ps);
+            J.block<1, 3>(0, 3) = ni.transpose();
+
+            double w = 1.0 / (1.0 + std::abs(r));
+            H += w * J.transpose() * J;
+            b += w * J.transpose() * (-r);
+            ++effective_count;
+        }
+
+        if (effective_count < 10) {
+            ROS_WARN("Too few correspondences: %d", effective_count);
+            continue;
+        }
+
+        Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
+        if (dx.norm() < convergence_threshold) {
+            ROS_INFO("Converged at iter %d with delta %.6f", iter, dx.norm());
+            break;
+        }
+        T = ExpSE3(dx) * T;
+    }
+
+    T_output = T;
+    return true;
+}
+
 
 void UpdateGlobalMap(const PointCloudPtr& cloud, const Eigen::Matrix4d& pose) {
     // 初始化地图
@@ -639,6 +736,11 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         // last_cloud = filtered_cloud;
         last_cloud = used_cloud;
         last_pose = current_pose;
+        
+        PointCloudPtr first_in_map(new PointCloudT());
+        pcl::transformPointCloud(*used_cloud, *first_in_map, current_pose);
+        local_map_frames.push_back(first_in_map);
+
         return;
     }
     static int frame_id = 0;
@@ -646,8 +748,8 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     if (frame_id % 10 == 0) {
         std::cout << "处理第 " << frame_id << " 帧点云" << std::endl;
         Eigen::Matrix4d T;
-        std::string last_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/last_cloud_filter_" + std::to_string(frame_id) + ".pcd";
-        std::string curr_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/current_cloud_filter_" + std::to_string(frame_id) + ".pcd";
+        std::string last_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/last_cloud_icp_test" + std::to_string(frame_id) + ".pcd";
+        std::string curr_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/current_cloud_icp_test" + std::to_string(frame_id) + ".pcd";
         pcl::io::savePCDFileBinary(last_path, *last_cloud);
         pcl::io::savePCDFileBinary(curr_path, *used_cloud);
 
@@ -669,10 +771,15 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         // // success = AlignNdt( );
         // ros::Duration elapsed = ros::Time::now() - start;
         // ROS_INFO("NDT Runtime: %.3f ms", elapsed.toSec() * 1000.0);
+        if (local_map_frames.empty()) {
+            ROS_WARN("Local map is empty. Skipping frame.");
+            return;
+        }
 
         ros::Time start = ros::Time::now();
         // success = GnAlignPoint2Point(used_cloud, last_cloud, T_curr_last);
         success = GnAlignPoint2Plane(used_cloud, last_cloud, T_curr_last);
+        // success = GnAlignPoint2Plane_LocalMap(used_cloud, local_map_frames, T_curr_last);
         ros::Duration elapsed = ros::Time::now() - start;
         ROS_INFO("ICPsuccess! Runtime: %.3f ms", elapsed.toSec() * 1000.0);
     }
@@ -683,8 +790,19 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         std::cout << "T_curr_last:\n" << T_curr_last << std::endl;
 
         // 更新当前位姿
-        current_pose = T_curr_last * last_pose;
+        current_pose = T_curr_last * last_pose;  // 当前位姿 = 上一帧位姿 * 当前帧与上一帧的变换矩阵
+        // bool is_keyframe = IsKeyframe(last_pose, current_pose);
         last_pose = current_pose;     
+
+        // PointCloudPtr current_in_map(new PointCloudT());
+        // pcl::transformPointCloud(*used_cloud, *current_in_map, current_pose);
+
+        // if (is_keyframe) {
+        //     local_map_frames.push_back(current_in_map);
+        //     if (local_map_frames.size() > max_local_frames) {
+        //         local_map_frames.pop_front();
+        //     }
+        // }
 
         // 计算 aligned 点云
         PointCloudPtr aligned_cloud(new PointCloudT());
@@ -723,10 +841,8 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         pub_target.publish(msg_target);
         pub_aligned.publish(msg_aligned);
 
-
         // 更新地图
         UpdateGlobalMap(used_cloud, current_pose);
-
         
         // 发布数据
         PublishOdometry(msg->header.stamp, current_pose);
@@ -751,6 +867,7 @@ int main(int argc, char** argv) {
     nh.param("convergence_threshold", convergence_threshold, 1e-4);
     nh.param("voxel_size", voxel_size, 0.3f);
     nh.param("local_voxel_size", local_voxel_size, 0.3f);
+    nh.param("max_local_frames", max_local_frames, 10);
 
     nh.param("ndt_resolution", ndt_resolution, 1.5f);
     nh.param("ndt_voxel_size", ndt_voxel_size, 0.5f);

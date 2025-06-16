@@ -1,5 +1,5 @@
 # 配准方法选择
-use_pcl_ndt: false               # 是否使用 NDT（否则使用 ICP）
+use_pcl_ndt: true               # 是否使用 NDT（否则使用 ICP）
 
 # ICP 参数（Gauss-Newton）
 max_iterations: 20
@@ -7,19 +7,14 @@ convergence_threshold: 1e-2
 
 # NDT 参数
 # ndt_resolution: 0.5
-ndt_resolution: 2
+ndt_resolution: 1.5
 ndt_step_size: 0.1
 ndt_trans_epsilon: 0.01
-ndt_max_iterations: 15
+ndt_max_iterations: 30
 ndt_voxel_size: 0.5
 
 # 点云预处理
 voxel_size: 0.1              # 输入点云的体素滤波大小
 
-# 地图可视化参数（可扩展）
-marker_color:
-  r: 0.0
-  g: 1.0
-  b: 0.0
-  a: 0.3
-marker_lifetime: 0.1         # RViz 可视化球的持续时间（秒）
+#局部地图参数
+max_local_frames: 5

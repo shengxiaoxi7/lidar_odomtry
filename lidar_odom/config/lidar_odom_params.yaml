@@ -1,20 +1,23 @@
 # 配准方法选择
-use_pcl_ndt: true               # 是否使用 NDT（否则使用 ICP）
+use_pcl_ndt: false               # 是否使用 NDT（否则使用 ICP）
+use_local_map: true              # 是否使用局部地图
 
 # ICP 参数（Gauss-Newton）
 max_iterations: 20
 convergence_threshold: 1e-2
 
+global_voxel_size: 1             
+source_voxel_size: 0.5
+
+#局部地图参数
+max_local_frames: 5
+keyframe_distance_thresh: 0.5
+keyframe_angle_thresh_deg: 10.0
+local_voxel_size: 0.2
+
 # NDT 参数
-# ndt_resolution: 0.5
 ndt_resolution: 1.5
 ndt_step_size: 0.1
 ndt_trans_epsilon: 0.01
 ndt_max_iterations: 30
 ndt_voxel_size: 0.5
-
-# 点云预处理
-voxel_size: 0.1              # 输入点云的体素滤波大小
-
-#局部地图参数
-max_local_frames: 5

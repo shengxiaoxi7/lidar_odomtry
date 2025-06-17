@@ -1,5 +1,7 @@
 <!-- launch/lidar_odom.launch -->
 <launch>
+    <param name="use_sim_time" value="true" />
+    
     <rosparam file="$(find lidar_odom)/config/lidar_odom_params.yaml" command="load"/>
     
     <node pkg="lidar_odom" type="lidar_system_node" name="lidar_system_node" output="screen" />
@@ -10,6 +12,7 @@
 
     <node name="rviz" pkg="rviz" type="rviz" args="-d $(find lidar_odom)/rviz/rviz.rviz" />
 
-    <node pkg="rosbag" type="play" name="rosbag_play" output="screen" args="-s 150 --rate 0.1 $(find lidar_odom)/data/ulhk_looselylio.bag" />
+    <node pkg="rosbag" type="play" name="rosbag_play" output="screen" args="$(find lidar_odom)/data/ulhk_looselylio.bag --clock" />
+    <!-- test3  -s 0 -rate 0.5 -->
 
 </launch>

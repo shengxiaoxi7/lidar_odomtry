@@ -7,7 +7,7 @@ max_iterations: 20
 convergence_threshold: 1e-2
 
 global_voxel_size: 1             
-source_voxel_size: 0.5
+source_voxel_size: 1
 
 #局部地图参数
 max_local_frames: 5

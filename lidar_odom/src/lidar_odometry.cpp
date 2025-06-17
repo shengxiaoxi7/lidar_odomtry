@@ -460,6 +460,7 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     frame_count++;
     if(frame_count % 100== 0){
         ROS_INFO("global_cloud size: %lu", global_map->size());
+        ROS_INFO("local_cloud size: %lu", local_map->size());
     }
     // 转换为PCL点云
     PointCloudPtr cloud(new PointCloudT());

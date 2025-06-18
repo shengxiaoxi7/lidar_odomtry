@@ -73,7 +73,6 @@ struct POINT_TO_POINT_COST {
     residual[2] = p_a_trans.z() - p_b.z();
     return true;
   }
-
   const Eigen::Vector3d pt_a, pt_b;
 };
 

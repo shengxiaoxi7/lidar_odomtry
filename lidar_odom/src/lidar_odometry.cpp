@@ -48,6 +48,7 @@ double keyframe_angle_thresh_deg;
 // 算法参数
 int max_iterations;
 double convergence_threshold;
+double r_change_threshold;
 float global_voxel_size;                   // 全局地图降采样大小
 float local_voxel_size;             // 局部地图降采样大小
 float source_voxel_size;            // 源点云降采样大小
@@ -60,8 +61,10 @@ float ndt_trans_epsilon;
 float ndt_voxel_size;
 int ndt_max_iterations;
 
-bool use_pcl_ndt;
+bool use_ndt;
 bool use_local_map;
+bool use_plane_fitting;
+bool use_pcl_normal;
 
 // 发布器
 ros::Publisher pub_odom;
@@ -121,8 +124,8 @@ PointCloudPtr DownsampleCloud(const PointCloudPtr& cloud, float leaf_size) {
     return filtered;
 }
 
-// // 高斯牛顿法ICP配准
-bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target, Eigen::Matrix4d& T_output) {
+// 高斯牛顿法ICP配准
+bool GnAlignPoint2PlanePCL(const PointCloudPtr& source, const PointCloudPtr& target, Eigen::Matrix4d& T_output) {
     if (!source || !target || source->empty() || target->empty()) return false;
     
     // ros::Time t_norm_start = ros::Time::now();
@@ -156,7 +159,6 @@ bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target
             const auto& all_curr_p_w = source->points[i];
             Eigen::Vector4d curr_p_w(all_curr_p_w.x, all_curr_p_w.y, all_curr_p_w.z, 1.0);
             Eigen::Vector3d trans_curr_p_w =  (T * curr_p_w).head<3>();
-
             
             PointT search_point;
             search_point.x = trans_curr_p_w.x();
@@ -207,6 +209,87 @@ bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target
     
 
     }
+    ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
+    ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
+
+    T_output = T;
+    return true;
+}
+
+bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target, Eigen::Matrix4d& T_output) {
+    if (!source || !target || source->empty() || target->empty()) return false;
+
+    // ros::Time t_kdtree_start = ros::Time::now();
+    
+    pcl::KdTreeFLANN<PointT>::Ptr kdtree(new pcl::KdTreeFLANN<PointT>());
+    kdtree->setInputCloud(target);
+
+    // ros::Duration t_kdtree_time = ros::Time::now() - t_kdtree_start;
+    // ROS_INFO("KdTree build time: %.3f ms", t_kdtree_time.toSec() * 1000.0);
+    // ros::Time t_iter_start = ros::Time::now();
+
+    Eigen::Matrix4d T = T_output;
+    for (int iter = 0; iter < max_iterations; ++iter) {
+
+        Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Zero();
+
+        int effective_count = 0;
+
+        for (size_t i = 0; i < source->size(); ++i) {
+            const auto& all_curr_p_w = source->points[i];
+            Eigen::Vector4d curr_p_w(all_curr_p_w.x, all_curr_p_w.y, all_curr_p_w.z, 1.0);
+            Eigen::Vector3d trans_curr_p_w =  (T * curr_p_w).head<3>();
+
+            PointT p_query(trans_curr_p_w.x(), trans_curr_p_w.y(), trans_curr_p_w.z());
+
+            int K = 5;
+            std::vector<int> indices(K);
+            std::vector<float> dists(K);
+
+            if (kdtree->nearestKSearch(p_query, K, indices, dists) >= 3) {
+                Eigen::Vector3d pj(target->points[indices[0]].x, target->points[indices[0]].y, target->points[indices[0]].z);
+                Eigen::Vector3d pl(target->points[indices[1]].x, target->points[indices[1]].y, target->points[indices[1]].z);
+                Eigen::Vector3d pm(target->points[indices[2]].x, target->points[indices[2]].y, target->points[indices[2]].z);
+                Eigen::Vector3d n = (pj - pl).cross(pj - pm);
+                
+                if (n.norm() < 1e-6) continue; // 平面退化vzz
+                n.normalize();
+                
+                // 残差：点到面距离
+                double r = n.dot(trans_curr_p_w - pj);
+                if (std::abs(r) > 1.0) continue;
+
+                // 雅可比
+                Eigen::Matrix<double, 1, 6> J;
+                J.block<1,3>(0,0) = -n.transpose() * T.block<3,3>(0,0) * SkewSymmetric(curr_p_w.head<3>());
+                J.block<1,3>(0,3) = n.transpose();
+
+                H += J.transpose() * J;
+                b += J.transpose() * (-r);
+                effective_count++;
+            }
+        }
+
+        if (effective_count < 10) {
+            ROS_WARN("Too few correspondences: %d", effective_count);
+            continue;
+        }
+
+        Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
+        if (dx.norm() < convergence_threshold) {
+            break;
+        }
+
+        Eigen::Matrix3d dR = ExpSO3(dx.head<3>());
+        Eigen::Vector3d dt = dx.tail<3>();
+
+        T.block<3,3>(0,0) = T.block<3,3>(0,0) * dR;
+        T.block<3,1>(0,3) += dt;
+        T(3, 3) = 1.0;
+
+    }
+
     // ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
     // ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
 
@@ -214,88 +297,113 @@ bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target
     return true;
 }
 
-// bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target, Eigen::Matrix4d& T_output) {
-//     if (!source || !target || source->empty() || target->empty()) return false;
+bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& target, Eigen::Matrix4d& T_output) {
+    if (!source || !target || source->empty() || target->empty()) return false;
 
-//     // ros::Time t_kdtree_start = ros::Time::now();
+    // ROS_INFO("target size: %zu, source size: %zu", target->size(), source->size());
     
-//     pcl::KdTreeFLANN<PointT>::Ptr kdtree(new pcl::KdTreeFLANN<PointT>());
-//     kdtree->setInputCloud(target);
+    // ros::Time t_kdtree_start = ros::Time::now();
+    pcl::KdTreeFLANN<PointT>::Ptr kdtree(new pcl::KdTreeFLANN<PointT>());
+    kdtree->setInputCloud(target);
+    // ros::Duration t_kdtree_time = ros::Time::now() - t_kdtree_start;
+    // ROS_INFO("KdTree build time: %.3f ms", t_kdtree_time.toSec() * 1000.0);
 
-//     // ros::Duration t_kdtree_time = ros::Time::now() - t_kdtree_start;
-//     // ROS_INFO("KdTree build time: %.3f ms", t_kdtree_time.toSec() * 1000.0);
-//     // ros::Time t_iter_start = ros::Time::now();
-
-//     Eigen::Matrix4d T = T_output;
-//     for (int iter = 0; iter < max_iterations; ++iter) {
-
-//         Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
-//         Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Zero();
-
-//         int effective_count = 0;
-
-//         for (size_t i = 0; i < source->size(); ++i) {
-//             const auto& all_curr_p_w = source->points[i];
-//             Eigen::Vector4d curr_p_w(all_curr_p_w.x, all_curr_p_w.y, all_curr_p_w.z, 1.0);
-//             Eigen::Vector3d trans_curr_p_w =  (T * curr_p_w).head<3>();
-
-          
-//             PointT p_query(trans_curr_p_w.x(), trans_curr_p_w.y(), trans_curr_p_w.z());
-
-//             std::vector<int> indices(5);
-//             std::vector<float> dists(5);
-
-//             int K = 5;
-//             if (kdtree->nearestKSearch(p_query, K, indices, dists) >= 3) {
-//                 Eigen::Vector3d pj(target->points[indices[0]].x, target->points[indices[0]].y, target->points[indices[0]].z);
-//                 Eigen::Vector3d pl(target->points[indices[1]].x, target->points[indices[1]].y, target->points[indices[1]].z);
-//                 Eigen::Vector3d pm(target->points[indices[2]].x, target->points[indices[2]].y, target->points[indices[2]].z);
-//                 Eigen::Vector3d n = (pj - pl).cross(pj - pm);
-                
-//                 if (n.norm() < 1e-6) continue; // 平面退化
-//                 n.normalize();
-                
-//                 // 残差：点到面距离
-//                 double r = n.dot(trans_curr_p_w - pj);
-//                 if (std::abs(r) > 1.0) continue;
-
-//                 // 雅可比
-//                 Eigen::Matrix<double, 1, 6> J;
-//                 J.block<1,3>(0,0) = -n.transpose() * T.block<3,3>(0,0) * SkewSymmetric(curr_p_w.head<3>());
-//                 J.block<1,3>(0,3) = n.transpose();
-
-//                 H += J.transpose() * J;
-//                 b += J.transpose() * (-r);
-//                 effective_count++;
-//             }
-//         }
-
-//         if (effective_count < 10) {
-//             ROS_WARN("Too few correspondences: %d", effective_count);
-//             continue;
-//         }
-
-//         Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
-//         if (dx.norm() < convergence_threshold) {
-//             break;
-//         }
-
-//         Eigen::Matrix3d dR = ExpSO3(dx.head<3>());
-//         Eigen::Vector3d dt = dx.tail<3>();
-
-//         T.block<3,3>(0,0) = T.block<3,3>(0,0) * dR;
-//         T.block<3,1>(0,3) += dt;
-//         T(3, 3) = 1.0;
+    double prev_residual = 10000.0;
+    double curr_residual = 0.0;
     
-        
-//     }
+    ros::Time t_iter_start = ros::Time::now();
 
-//     // ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
-//     // ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
+    Eigen::Matrix4d T = T_output;
 
-//     T_output = T;
-//     return true;
-// }
+    for (int iter = 0; iter < max_iterations; ++iter) {
+
+        Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Zero();
+
+        int effective_count = 0;
+        double total_residual = 0.0;
+
+        for (size_t i = 0; i < source->size(); ++i) {
+            const auto& all_curr_p_w = source->points[i];
+            Eigen::Vector4d curr_p_w(all_curr_p_w.x, all_curr_p_w.y, all_curr_p_w.z, 1.0);
+            Eigen::Vector3d trans_curr_p_w =  (T * curr_p_w).head<3>();
+
+            PointT p_query(trans_curr_p_w.x(), trans_curr_p_w.y(), trans_curr_p_w.z());
+
+            int K = 10;
+            std::vector<int> indices(K);
+            std::vector<float> dists(K);
+
+            if (kdtree->nearestKSearch(p_query, K, indices, dists) >= 3) {
+                
+                Eigen::MatrixXd A(K, 4);
+                for (int j = 0; j < K; ++j) {
+                    const auto& pt = target->points[indices[j]];
+                    A.row(j) << pt.x, pt.y, pt.z, 1.0;
+                }
+
+                Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinV);
+                Eigen::Matrix<double, 4, 1> plane = svd.matrixV().col(3);  //最小特征值对应的特征向量
+
+                Eigen::Vector3d n(plane.x(), plane.y(), plane.z());
+                double d = plane[3];
+                double norm_n = n.norm();
+                if (norm_n < 1e-6) continue;
+
+                double r = n.dot(trans_curr_p_w) + d;  // 点到平面的距离
+                if (std::abs(r) > 1.0) continue;
+
+                total_residual += r * r;
+
+                // 雅可比
+                Eigen::Matrix<double, 1, 6> J;
+                J.block<1,3>(0,0) = -n.transpose() * T.block<3,3>(0,0) * SkewSymmetric(curr_p_w.head<3>());
+                J.block<1,3>(0,3) = n.transpose();
+
+                H += J.transpose() * J;
+                b += J.transpose() * (-r);
+                effective_count++;
+            }
+        }
+
+        if (effective_count == 0) {
+            ROS_WARN("No effective points found in this iteration, skipping.");
+            break;
+        }
+
+        double avg_residual = total_residual / effective_count;
+
+        // K = 5，取source_voxel_size=1时，target size为3-5万，source size为2500左右，effective count为1900左右，运行时间1000ms左右
+        // K = 5，取source_voxel_size=2时，source size为800-1000，effective count为700左右，运行时间200-500ms
+        // K = 10，运行时间500-700ms
+        // ROS_INFO("The number of the effective points: %d", effective_count);
+
+        Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
+
+        Eigen::Matrix3d dR = ExpSO3(dx.head<3>());
+        Eigen::Vector3d dt = dx.tail<3>();
+
+        T.block<3,3>(0,0) = T.block<3,3>(0,0) * dR;
+        T.block<3,1>(0,3) += dt;
+        T(3, 3) = 1.0;
+
+        if (dx.norm() < convergence_threshold ||
+            (iter > 3 && std::abs(prev_residual - avg_residual) < r_change_threshold)) {
+            break;
+        }
+
+        ROS_INFO("Iteration %d: delta norm = %.6f: avg_residual = %.6f: prev_residual = %.6f", iter, dx.norm(), avg_residual, prev_residual);
+        // ROS_INFO("%.6f", convergence_threshold);
+
+        prev_residual = avg_residual;
+    }
+
+    ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
+    ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
+
+    T_output = T;
+    return true;
+}
 
 // NDT配准函数
 bool pclNdtAlign(const PointCloudPtr& source, const PointCloudPtr& target, Eigen::Matrix4d& T_output) {
@@ -483,7 +591,7 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
 
     PointCloudPtr source_cloud = DownsampleCloud(current_cloud, source_voxel_size);
 
-    if (use_pcl_ndt) {
+    if (use_ndt) {
         ros::Time start = ros::Time::now();
         success = pclNdtAlign(source_cloud, last_cloud, T_curr_last);
         // success = CustomNdtAlign(used_cloud, last_cloud, T_curr_last);
@@ -493,12 +601,19 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         }
     } else {
         ros::Time start = ros::Time::now();
-        if(use_local_map){
-            success = GnAlignPoint2Plane(source_cloud, localmap_cloud, T_curr_last);
-        } else{
-            // success = GnAlignPoint2Point(used_cloud, last_cloud, T_curr_last);
+
+        if (!use_local_map) {
             success = GnAlignPoint2Plane(source_cloud, last_cloud, T_curr_last);
+        } else {
+            if (use_plane_fitting) {
+                success = GnAlignPoint2PlanePCA(source_cloud, localmap_cloud, T_curr_last);
+            } else if (use_pcl_normal) {
+                success = GnAlignPoint2PlanePCL(source_cloud, localmap_cloud, T_curr_last);
+            } else {
+                success = GnAlignPoint2Plane(source_cloud, localmap_cloud, T_curr_last);
+            }
         }
+
         ros::Duration elapsed = ros::Time::now() - start;
         if(frame_count % 10 == 0){
             ROS_INFO("ICPsuccess! Runtime: %.3f ms", elapsed.toSec() * 1000.0);
@@ -523,7 +638,7 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
                 local_map_frames.pop_front();
             }
             keyframe_num++;
-            ROS_INFO("Added a new keyframe. Total: %d", keyframe_num);
+            // ROS_INFO("Added a new keyframe. Total: %d", keyframe_num);
             // ROS_INFO("Current keyframe count: %lu", local_map_frames.size());
         }
 
@@ -593,17 +708,20 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
 
 }
 
-
 int main(int argc, char** argv) {
     // 初始化ROS节点
     ros::init(argc, argv, "odometry");
     ros::NodeHandle nh;
 
-    nh.param("use_pcl_ndt", use_pcl_ndt, false);
+    nh.param("use_ndt", use_ndt, false);
     nh.param("use_local_map", use_local_map, false);
+    nh.param("use_plane_fitting", use_plane_fitting, false);
+    nh.param("use_pcl_normal", use_pcl_normal, false);
+    
     nh.param("max_iterations", max_iterations, 10);
-    nh.param("convergence_threshold", convergence_threshold, 1e-4);
-    nh.param("global_voxel_size", global_voxel_size, 0.1f);
+    nh.param("convergence_threshold", convergence_threshold, 1e-2);
+    nh.param("r_change_threshold", r_change_threshold, 1e-4);
+    nh.param("global_voxel_size", global_voxel_size, 0.2f);
     nh.param("local_voxel_size", local_voxel_size, 0.2f);
     nh.param("source_voxel_size", source_voxel_size, 0.5f);
     
@@ -633,7 +751,7 @@ int main(int argc, char** argv) {
     // 创建订阅者
     ros::Subscriber sub_cloud = nh.subscribe("/velodyne_cloud", 100, CloudCallback);
     
-    std::cout << "使用" << (use_pcl_ndt ? "NDT" : "ICP") << "配准" << std::endl;
+    std::cout << "使用" << (use_ndt ? "NDT" : "ICP") << "配准" << std::endl;
     
     // 循环处理回调
     ros::spin();

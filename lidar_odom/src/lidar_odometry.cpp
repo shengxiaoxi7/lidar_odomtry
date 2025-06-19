@@ -14,12 +14,18 @@
 #include <pcl/filters/approximate_voxel_grid.h>
 #include <pcl/visualization/pcl_visualizer.h>
 #include <pcl/features/normal_3d.h>
+#include <pcl/io/pcd_io.h>
 
 #include <Eigen/Dense>
 #include <deque>
 #include <unordered_map>
 #include <vector>
 #include <cmath>
+#include <sys/stat.h>
+#include <cstdlib>
+#include <string>  
+#include <iomanip> 
+#include <fstream>   
 
 using PointT = pcl::PointXYZ;
 using PointCloudT = pcl::PointCloud<PointT>;
@@ -33,6 +39,7 @@ using KeyType = Eigen::Vector3i;
 
 Eigen::Matrix4d T_curr_last = Eigen::Matrix4d::Identity();
 Eigen::Matrix4d curr_pose_w = Eigen::Matrix4d::Identity();  // 当前位姿
+Eigen::Matrix4d last_keyframe_pose = Eigen::Matrix4d::Identity();  // 当前位姿
 Eigen::Matrix4d last_pose_w = Eigen::Matrix4d::Identity();     // 上一帧位姿
 
 PointCloudPtr last_cloud = nullptr;         // 上一帧点云
@@ -44,6 +51,8 @@ std::deque<PointCloudPtr> local_map_frames;
 int max_local_frames;  // 最多保留帧数
 double keyframe_distance_thresh;
 double keyframe_angle_thresh_deg;
+std::string loop_result_path;
+std::string map_result_path;
 
 // 算法参数
 int max_iterations;
@@ -72,11 +81,13 @@ ros::Publisher pub_path;
 ros::Publisher pub_global_map;
 ros::Publisher pub_local_map;
 ros::Publisher pub_debug_marker;
-nav_msgs::Path laser_path;  // 轨迹路径
 ros::Publisher pub_source;
 ros::Publisher pub_target;
 ros::Publisher pub_aligned;
 ros::Publisher pub_localmap;
+ros::Publisher pub_keyframe_pose;
+ros::Publisher pub_keyframe_cloud;
+nav_msgs::Path laser_path;  // 轨迹路径
 
 Mat3d ComputeCovariance(const std::vector<Vec3d>& points, const Vec3d& mean) {
     Mat3d cov = Mat3d::Zero();
@@ -178,11 +189,11 @@ bool GnAlignPoint2PlanePCL(const PointCloudPtr& source, const PointCloudPtr& tar
             Eigen::Vector3d last_p_w(pt.x, pt.y, pt.z);
             Eigen::Vector3d ni(n.normal_x, n.normal_y, n.normal_z);
 
-            if (ni.norm() < 1e-3) continue;
+            if (ni.norm() < 1e-6) continue;
 
             // 残差：点到面距离
             double r = (trans_curr_p_w - last_p_w).dot(ni);
-            if (std::abs(r) > 1.0) continue;
+            if (std::abs(r) > 1) continue;
 
             // 雅可比
             Eigen::Matrix<double, 1, 6> J;
@@ -210,7 +221,7 @@ bool GnAlignPoint2PlanePCL(const PointCloudPtr& source, const PointCloudPtr& tar
 
     }
     ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
-    ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
+    // ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
 
     T_output = T;
     return true;
@@ -258,7 +269,7 @@ bool GnAlignPoint2Plane(const PointCloudPtr& source, const PointCloudPtr& target
                 
                 // 残差：点到面距离
                 double r = n.dot(trans_curr_p_w - pj);
-                if (std::abs(r) > 1.0) continue;
+                if (std::abs(r) > 0.3) continue;
 
                 // 雅可比
                 Eigen::Matrix<double, 1, 6> J;
@@ -309,9 +320,8 @@ bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& tar
     // ROS_INFO("KdTree build time: %.3f ms", t_kdtree_time.toSec() * 1000.0);
 
     double prev_residual = 10000.0;
-    double curr_residual = 0.0;
-    
-    ros::Time t_iter_start = ros::Time::now();
+
+    // ros::Time t_iter_start = ros::Time::now();
 
     Eigen::Matrix4d T = T_output;
 
@@ -330,7 +340,7 @@ bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& tar
 
             PointT p_query(trans_curr_p_w.x(), trans_curr_p_w.y(), trans_curr_p_w.z());
 
-            int K = 10;
+            int K = 5;
             std::vector<int> indices(K);
             std::vector<float> dists(K);
 
@@ -339,11 +349,22 @@ bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& tar
                 Eigen::MatrixXd A(K, 4);
                 for (int j = 0; j < K; ++j) {
                     const auto& pt = target->points[indices[j]];
+
                     A.row(j) << pt.x, pt.y, pt.z, 1.0;
                 }
 
                 Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinV);
                 Eigen::Matrix<double, 4, 1> plane = svd.matrixV().col(3);  //最小特征值对应的特征向量
+
+                for (int t = 0; t < K ; ++t) {
+                    const auto& pt = target->points[indices[t]];
+                    Eigen::Vector3d pj(pt.x, pt.y, pt.z);
+                    double err = plane.head<3>().dot(pj) + plane[3];
+                    if (err * err > 0.01) {
+                        continue;;
+                    }
+                }
+
 
                 Eigen::Vector3d n(plane.x(), plane.y(), plane.z());
                 double d = plane[3];
@@ -351,7 +372,7 @@ bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& tar
                 if (norm_n < 1e-6) continue;
 
                 double r = n.dot(trans_curr_p_w) + d;  // 点到平面的距离
-                if (std::abs(r) > 1.0) continue;
+                // if (std::abs(r) > 0.3) continue;
 
                 total_residual += r * r;
 
@@ -387,8 +408,7 @@ bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& tar
         T.block<3,1>(0,3) += dt;
         T(3, 3) = 1.0;
 
-        if (dx.norm() < convergence_threshold ||
-            (iter > 3 && std::abs(prev_residual - avg_residual) < r_change_threshold)) {
+        if (dx.norm() < convergence_threshold ) {
             break;
         }
 
@@ -398,8 +418,8 @@ bool GnAlignPoint2PlanePCA(const PointCloudPtr& source, const PointCloudPtr& tar
         prev_residual = avg_residual;
     }
 
-    ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
-    ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
+    // ros::Duration t_iter_time = ros::Time::now() - t_iter_start;
+    // ROS_INFO("Iter time: %.3f ms", t_iter_time.toSec() * 1000.0);
 
     T_output = T;
     return true;
@@ -559,6 +579,115 @@ pcl::PointCloud<pcl::PointXYZRGB>::Ptr ColorizePointCloud(
     return colored_cloud;
 }
 
+void SaveKeyframe(const Eigen::Matrix4d& pose, const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, int keyframe_id) {
+    static std::ofstream fout;
+    static bool initialized = false;
+
+    if (!initialized) {
+        std::string txt_path_1 = loop_result_path + "/keyframes.txt";
+        fout.open(txt_path_1, std::ios::app);
+        if (!fout.is_open()) {
+            ROS_ERROR("Cannot open file: %s", txt_path_1.c_str());
+            return;
+        }
+        initialized = true;
+    }
+
+    // 写入关键帧位姿
+    Eigen::Quaterniond q(pose.block<3, 3>(0, 0));
+    Eigen::Vector3d t = pose.block<3, 1>(0, 3);
+
+    fout << std::fixed << std::setprecision(9)
+         << keyframe_id << " " << ros::Time::now().toSec() << " "
+         << t.x() << " " << t.y() << " " << t.z() << " "
+         << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+
+    // 保存点云文件
+    std::string folder_1 = loop_result_path;
+    static bool folder_created = false;
+    if (!folder_created) {
+        std::string cmd = "mkdir -p " + folder_1;
+        system(cmd.c_str());
+        folder_created = true;
+    }
+
+    std::string filename = folder_1 + "/" + std::to_string(keyframe_id) + ".pcd";
+    if (pcl::io::savePCDFileBinary(filename, *cloud) == -1) {
+        ROS_ERROR("Failed to save keyframe %d to %s", keyframe_id, filename.c_str());
+        return;
+    }
+
+    // ROS_INFO("Saved keyframe %d to %s", keyframe_id, filename.c_str());
+}
+
+void SaveMapframe(const Eigen::Matrix4d& pose,const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, int frame_id) {
+    static std::ofstream fout;
+    static bool initialized = false;
+
+    if (!initialized) {
+        std::string txt_path_2 = map_result_path + "/keyframes.txt";
+        fout.open(txt_path_2, std::ios::app);
+        if (!fout.is_open()) {
+            ROS_ERROR("Cannot open file: %s", txt_path_2.c_str());
+            return;
+        }
+        initialized = true;
+    }
+
+    // 写入关键帧位姿
+    Eigen::Quaterniond q(pose.block<3, 3>(0, 0));
+    Eigen::Vector3d t = pose.block<3, 1>(0, 3);
+
+    fout << std::fixed << std::setprecision(9)
+         << frame_id << " " << ros::Time::now().toSec() << " "
+         << t.x() << " " << t.y() << " " << t.z() << " "
+         << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+
+    // 保存点云文件
+    std::string folder_2 = map_result_path;
+    static bool folder_created = false;
+    if (!folder_created) {
+        std::string cmd = "mkdir -p " + folder_2;
+        system(cmd.c_str());
+        folder_created = true;
+    }
+
+    std::string filename = folder_2 + "/" + std::to_string(frame_id) + ".pcd";
+    if (pcl::io::savePCDFileBinary(filename, *cloud) == -1) {
+        ROS_ERROR("Failed to save keyframe %d to %s", frame_id, filename.c_str());
+        return;
+    }
+
+    // ROS_INFO("Saved keyframe %d to %s", frame_id, filename.c_str());
+    frame_id++;
+}
+
+void PublishKeyframe(int keyframe_id, const ros::Time& stamp, const Eigen::Matrix4d& pose, const PointCloudPtr& cloud_in_map, ros::Publisher& pub_keyframe_pose, ros::Publisher& pub_keyframe_cloud) {
+    geometry_msgs::PoseStamped pose_msg;
+    pose_msg.header.seq = keyframe_id;
+    pose_msg.header.stamp = stamp;
+    pose_msg.header.frame_id = "map";
+
+    pose_msg.pose.position.x = pose(0, 3);
+    pose_msg.pose.position.y = pose(1, 3);
+    pose_msg.pose.position.z = pose(2, 3);
+    Eigen::Matrix3d R = pose.block<3, 3>(0, 0);
+    Eigen::Quaterniond q(R);
+    pose_msg.pose.orientation.x = q.x();
+    pose_msg.pose.orientation.y = q.y();
+    pose_msg.pose.orientation.z = q.z();
+    pose_msg.pose.orientation.w = q.w();
+    pub_keyframe_pose.publish(pose_msg);
+
+    sensor_msgs::PointCloud2 cloud_msg;
+    pcl::toROSMsg(*cloud_in_map, cloud_msg);
+    cloud_msg.header.seq = keyframe_id;
+    cloud_msg.header.stamp = stamp;
+    cloud_msg.header.frame_id = "map";
+    pub_keyframe_cloud.publish(cloud_msg);
+}
+
+
 // 点云回调函数
 void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     
@@ -581,6 +710,7 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
 
         last_cloud = current_cloud;
         last_pose_w = curr_pose_w;   // 改变current_pose的初始值，last_pose对应改变
+        last_keyframe_pose = curr_pose_w;
         
         local_map_frames.push_back(current_cloud);
         localmap_cloud.reset(new PointCloudT(*current_cloud));
@@ -593,7 +723,7 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
 
     if (use_ndt) {
         ros::Time start = ros::Time::now();
-        success = pclNdtAlign(source_cloud, last_cloud, T_curr_last);
+        success = pclNdtAlign(source_cloud, localmap_cloud, T_curr_last);
         // success = CustomNdtAlign(used_cloud, last_cloud, T_curr_last);
         ros::Duration elapsed = ros::Time::now() - start;
         if(frame_count % 10 == 0){
@@ -613,6 +743,7 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
                 success = GnAlignPoint2Plane(source_cloud, localmap_cloud, T_curr_last);
             }
         }
+        ROS_INFO("taget size: %lu", localmap_cloud->size());
 
         ros::Duration elapsed = ros::Time::now() - start;
         if(frame_count % 10 == 0){
@@ -629,7 +760,8 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         curr_pose_w = last_pose_w * T_curr_last;
         static int keyframe_num = 0;
 
-        if (IsKeyframe(last_pose_w, curr_pose_w)) {
+        // if (keyframe_num < 5 || IsKeyframe(last_pose_w, curr_pose_w)) {
+        if (keyframe_num < 3 || IsKeyframe(last_keyframe_pose, curr_pose_w)) {
             PointCloudPtr current_in_map(new PointCloudT());
             pcl::transformPointCloud(*current_cloud, *current_in_map, curr_pose_w);
             local_map_frames.push_back(current_in_map);
@@ -638,9 +770,23 @@ void CloudCallback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
                 local_map_frames.pop_front();
             }
             keyframe_num++;
-            // ROS_INFO("Added a new keyframe. Total: %d", keyframe_num);
-            // ROS_INFO("Current keyframe count: %lu", local_map_frames.size());
+            ROS_INFO("Added a new keyframe. Total: %d", keyframe_num);
+            SaveKeyframe(curr_pose_w, source_cloud, keyframe_num);
+            last_keyframe_pose = curr_pose_w;  // 更新上一个关键帧位姿
+            PublishKeyframe(keyframe_num, msg->header.stamp, curr_pose_w, current_in_map, pub_keyframe_pose, pub_keyframe_cloud);
         }
+
+        // if (frame_count > 2150 && frame_count % 5 == 0) {
+        //     keyframe_num++;
+        //     SaveKeyframe(curr_pose_w, source_cloud, keyframe_num);
+        // }
+
+        // if(frame_count > 0 && frame_count % 10 == 0){
+        //     // SaveMapframe(curr_pose_w, current_cloud, frame_count/5 );
+        //     ROS_INFO("frame_count is %d, keyframe_num is %d", frame_count, keyframe_num); 
+        // }
+            
+        // ROS_INFO("Current keyframe count: %lu", local_map_frames.size());
 
         localmap_cloud->clear();
         for (const auto& frame : local_map_frames) {
@@ -735,6 +881,8 @@ int main(int argc, char** argv) {
     nh.param("ndt_trans_epsilon", ndt_trans_epsilon, 0.01f);
     nh.param("ndt_max_iterations", ndt_max_iterations, 10);
 
+    nh.param("map_result_path", map_result_path, std::string("/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/global_map"));
+    nh.param("loop_result_path", loop_result_path, std::string("/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/loop"));
     
     // 创建发布器
     pub_odom = nh.advertise<nav_msgs::Odometry>("/laser_odom", 100);
@@ -746,7 +894,8 @@ int main(int argc, char** argv) {
     pub_target = nh.advertise<sensor_msgs::PointCloud2>("/target_cloud", 10);
     pub_aligned = nh.advertise<sensor_msgs::PointCloud2>("/aligned_cloud", 10);
     pub_localmap = nh.advertise<sensor_msgs::PointCloud2>("/localmap_cloud", 10);
-
+    pub_keyframe_pose = nh.advertise<geometry_msgs::PoseStamped>("/keyframe_pose", 10);
+    pub_keyframe_cloud = nh.advertise<sensor_msgs::PointCloud2>("/keyframe_cloud", 10);
     
     // 创建订阅者
     ros::Subscriber sub_cloud = nh.subscribe("/velodyne_cloud", 100, CloudCallback);

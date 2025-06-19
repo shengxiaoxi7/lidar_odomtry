@@ -36,3 +36,5 @@ target_link_libraries(lidar_odometry ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PC
 add_executable(test_odometry src/test_odometry.cpp)
 target_link_libraries(test_odometry ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
 
+add_executable(test_loop src/test_loop.cpp)
+target_link_libraries(test_loop ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})

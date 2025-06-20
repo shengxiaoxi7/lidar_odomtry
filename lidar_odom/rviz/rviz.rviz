@@ -322,6 +322,16 @@ Visualization Manager:
       Name: Marker
       Namespaces:
         keyframe_graph: true
+        keyframe_sphere: true
+        keyframe_text: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /loop_edges
+      Name: Marker
+      Namespaces:
+        loop_edges: true
       Queue Size: 100
       Value: true
   Enabled: true
@@ -352,7 +362,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 94.63505554199219
+      Distance: 97.60751342773438
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -360,17 +370,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -2.815420627593994
-        Y: 2.896829128265381
-        Z: 3.56655216217041
-      Focal Shape Fixed Size: true
+        X: -3.719160795211792
+        Y: 12.076016426086426
+        Z: -5.909182071685791
+      Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
+      Pitch: 1.1603978872299194
       Target Frame: <Fixed Frame>
-      Yaw: 1.5553934574127197
+      Yaw: 1.6303974390029907
     Saved: ~
 Window Geometry:
   Displays:

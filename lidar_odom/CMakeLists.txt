@@ -39,5 +39,12 @@ target_link_libraries(test_odometry ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL
 add_executable(test_loop src/test_loop.cpp)
 target_link_libraries(test_loop ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
 
-add_executable(test_offline_loop src/test_offline_loop.cpp)
-target_link_libraries(test_offline_loop ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
+add_executable(loop_detection_and_optimization src/loop_detection_and_optimization.cpp)
+target_link_libraries(loop_detection_and_optimization ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
+
+add_executable(loop_node src/loop_node.cpp)
+target_link_libraries(loop_node ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
+
+add_executable(loop_visualization src/loop_visualization.cpp)
+target_link_libraries(loop_visualization ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
+

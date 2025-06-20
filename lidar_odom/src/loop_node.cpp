@@ -1,43 +1,46 @@
+// 只用于回环检测，并构建回环边
 #include <ros/ros.h>
 #include <visualization_msgs/Marker.h>
-#include <geometry_msgs/PoseStamped.h>
-#include <nav_msgs/Path.h>
-#include <Eigen/Core>
-#include <Eigen/Geometry>
-
+#include <geometry_msgs/Point.h>
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <map>
+
 #include <pcl/io/pcd_io.h>
-#include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/common/transforms.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
 
 using PointT = pcl::PointXYZ;
 using PointCloudT = pcl::PointCloud<PointT>;
-using PointCloudPtr = pcl::PointCloud<PointT>::Ptr;
 
-// 订阅关键帧位姿话题
-ros::Publisher pub_marker;
-ros::Publisher pub_path;
+std::string result_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/pcl_kf_distance_1";
 
-int skip_id = 20;
-int min_id_interval = 30;
-double time_thresh = 10.0;
-double distance_thresh = 30.0;
-std::string result_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/loop";
+double time_thresh = 30.0; 
+double distance_thresh = 25.0; 
+int min_id_interval = 50;
+int skip_id = 0;
 
 struct Keyframe {
     int id;
     double timestamp;
     Eigen::Vector3d t;
     Eigen::Quaterniond q;
-    PointCloudPtr cloud;  // 追加：关键帧对应的点云
 };
 
+std::vector<Keyframe> keyframes;
 
 struct LoopCandidate {
-    int id_a, id_b;
+    int id_a;
+    int id_b;
     Eigen::Matrix4d T_a_to_b;
 
     LoopCandidate(int a, int b, const Eigen::Matrix4d& T) : id_a(a), id_b(b), T_a_to_b(T) {}
@@ -52,9 +55,6 @@ struct LoopConstraint {
     LoopConstraint(int a, int b, const Eigen::Matrix4d& T, double e)
         : id_a(a), id_b(b), T_a_to_b(T), rmse(e) {}
 };
-
-std::vector<Keyframe> keyframes;
-
 
 Eigen::Matrix3d SkewSymmetric(const Eigen::Vector3d& v) {
     Eigen::Matrix3d m;
@@ -76,6 +76,29 @@ Eigen::Matrix3d ExpSO3(const Eigen::Vector3d& omega) {
     return Eigen::Matrix3d::Identity() + std::sin(theta) * axis_skew + (1 - std::cos(theta)) * axis_skew * axis_skew;
 }
 
+// 读取关键帧位姿
+bool LoadKeyframesFromFile(const std::string& path) {
+    std::ifstream fin(path);
+    if (!fin.is_open()) {
+        ROS_ERROR("Cannot open keyframe file: %s", path.c_str());
+        return false;
+    }
+
+    ROS_INFO("keyframe file is opened from: %s", path.c_str());
+
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        Keyframe kf;
+        double qx, qy, qz, qw;
+        iss >> kf.id >> kf.timestamp >> kf.t.x() >> kf.t.y() >> kf.t.z() >> qx >> qy >> qz >> qw;
+        kf.q = Eigen::Quaterniond(qw, qx, qy, qz);
+        keyframes.push_back(kf);
+    }
+
+    return true;
+}
 
 bool IsLoopCandidate(const Keyframe& a, const Keyframe& b, double distance_thresh, double time_thresh) {
     if (std::abs(a.timestamp - b.timestamp) < time_thresh) return false; // 排除时间上相近的帧
@@ -121,8 +144,7 @@ void DetectLoopCandidates(const std::vector<Keyframe>& keyframes, std::vector<Lo
     std::cout << "Detected " << loop_candidates.size() << " loop candidates." << std::endl;
 }
 
-bool GnAlignPoint2Plane(const PointCloudT::Ptr& cloud_a, const PointCloudT::Ptr& cloud_b, const LoopCandidate& loop,
-                        Eigen::Matrix4d& T_refined, double& rmse_out) {
+bool GnAlignPoint2Plane(const PointCloudT::Ptr& cloud_a, const PointCloudT::Ptr& cloud_b, const LoopCandidate& loop, Eigen::Matrix4d& T_refined, double& rmse_out) {
     if (!cloud_a || !cloud_b || cloud_a->empty() || cloud_b->empty()) return false;
 
     pcl::KdTreeFLANN<PointT>::Ptr kdtree(new pcl::KdTreeFLANN<PointT>());
@@ -192,57 +214,48 @@ bool GnAlignPoint2Plane(const PointCloudT::Ptr& cloud_a, const PointCloudT::Ptr&
     return true;
 }
 
-void KeyframePoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-    static int id_counter = 0;
+void PublishLoopEdges(ros::Publisher& pub_graph, const std::vector<Keyframe>& keyframes, const std::vector<LoopConstraint>& loop_constraints) {
+    visualization_msgs::Marker loop_edge_marker;
+    loop_edge_marker.header.frame_id = "map";
+    loop_edge_marker.header.stamp = ros::Time::now();
+    loop_edge_marker.ns = "loop_edges";
+    loop_edge_marker.id = 999; 
+    loop_edge_marker.type = visualization_msgs::Marker::LINE_LIST;
+    loop_edge_marker.action = visualization_msgs::Marker::ADD;
+    loop_edge_marker.scale.x = 0.25;
+    loop_edge_marker.color.r = 0.0;
+    loop_edge_marker.color.g = 1.0;
+    loop_edge_marker.color.b = 0.0;
+    loop_edge_marker.color.a = 1.0;
 
-    Keyframe kf;
-    kf.id = id_counter++;
-    kf.timestamp = msg->header.stamp.toSec();
-    kf.t = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
-    kf.q = Eigen::Quaterniond(
-        msg->pose.orientation.w,
-        msg->pose.orientation.x,
-        msg->pose.orientation.y,
-        msg->pose.orientation.z
-    );
+    for (const auto& loop : loop_constraints) {
+        geometry_msgs::Point p1, p2;
+        const auto& kf1 = keyframes[loop.id_a-1];
+        const auto& kf2 = keyframes[loop.id_b-1];
 
-    keyframes.push_back(kf);
+        p1.x = kf1.t.x();
+        p1.y = kf1.t.y();
+        p1.z = kf1.t.z();
+
+        p2.x = kf2.t.x();
+        p2.y = kf2.t.y();
+        p2.z = kf2.t.z();
+
+        loop_edge_marker.points.push_back(p1);
+        loop_edge_marker.points.push_back(p2);
+    }
+
+    pub_graph.publish(loop_edge_marker);
 }
 
-void KeyframeCloudCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-    static int id_counter = 0;
+void PublishKeyframeGraph(ros::Publisher& pub_graph, const std::vector<Keyframe>& keyframes) {
 
-    Keyframe kf;
-    kf.id = id_counter++;
-    kf.timestamp = msg->header.stamp.toSec();
-    kf.t = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
-    kf.q = Eigen::Quaterniond(
-        msg->pose.orientation.w,
-        msg->pose.orientation.x,
-        msg->pose.orientation.y,
-        msg->pose.orientation.z
-    );
-
-    keyframes.push_back(kf);
-}
-
-void PublishVisualization() {
-    // 1. 清除旧 Marker
-    visualization_msgs::Marker clear_all;
-    clear_all.action = visualization_msgs::Marker::DELETEALL;
-    pub_marker.publish(clear_all);
-
-    if (keyframes.size() < 2) return;
-
-    ros::Time stamp = ros::Time::now();
-
-    // 2. 发布轨迹线
     visualization_msgs::Marker line_list;
     line_list.header.frame_id = "map";
-    line_list.header.stamp = stamp;
-    line_list.ns = "trajectory_line";
+    line_list.header.stamp = ros::Time::now();
+    line_list.ns = "keyframe_graph";
     line_list.id = 0;
-    line_list.type = visualization_msgs::Marker::LINE_STRIP;
+    line_list.type = visualization_msgs::Marker::LINE_LIST;
     line_list.action = visualization_msgs::Marker::ADD;
     line_list.scale.x = 0.05;
     line_list.color.r = 1.0;
@@ -250,152 +263,122 @@ void PublishVisualization() {
     line_list.color.b = 0.0;
     line_list.color.a = 1.0;
 
-    for (const auto& kf : keyframes) {
-        geometry_msgs::Point p;
-        p.x = kf.t.x();
-        p.y = kf.t.y();
-        p.z = kf.t.z();
-        line_list.points.push_back(p);
-    }
-    pub_marker.publish(line_list);
-
-    // 3. 发布最新关键帧小球
-    const auto& kf = keyframes.back();
-    visualization_msgs::Marker sphere;
-    sphere.header.frame_id = "map";
-    sphere.header.stamp = stamp;
-    sphere.ns = "keyframe_sphere";
-    sphere.id = 1;
-    sphere.type = visualization_msgs::Marker::SPHERE;
-    sphere.action = visualization_msgs::Marker::ADD;
-    sphere.pose.position.x = kf.t.x();
-    sphere.pose.position.y = kf.t.y();
-    sphere.pose.position.z = kf.t.z();
-    sphere.scale.x = 0.2;
-    sphere.scale.y = 0.2;
-    sphere.scale.z = 0.2;
-    sphere.color.r = 1.0;
-    sphere.color.g = 0.0;
-    sphere.color.b = 0.0;
-    sphere.color.a = 1.0;
-    pub_marker.publish(sphere);
-
-    // 4. 发布文字标签
-    visualization_msgs::Marker text;
-    text.header.frame_id = "map";
-    text.header.stamp = stamp;
-    text.ns = "keyframe_text";
-    text.id = 2;
-    text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-    text.action = visualization_msgs::Marker::ADD;
-    text.pose.position.x = kf.t.x();
-    text.pose.position.y = kf.t.y();
-    text.pose.position.z = kf.t.z() + 0.3;
-    text.scale.z = 0.3;
-    text.color.r = 1.0;
-    text.color.g = 1.0;
-    text.color.b = 1.0;
-    text.color.a = 1.0;
-    text.text = std::to_string(kf.id);
-    pub_marker.publish(text);
-
-    // 5. 发布 Path 消息（用于轨迹线）
-    nav_msgs::Path path;
-    path.header.frame_id = "map";
-    path.header.stamp = stamp;
-    for (const auto& kf : keyframes) {
-        geometry_msgs::PoseStamped pose;
-        pose.header.frame_id = "map";
-        pose.header.stamp = stamp;
-        pose.pose.position.x = kf.t.x();
-        pose.pose.position.y = kf.t.y();
-        pose.pose.position.z = kf.t.z();
-        pose.pose.orientation.x = kf.q.x();
-        pose.pose.orientation.y = kf.q.y();
-        pose.pose.orientation.z = kf.q.z();
-        pose.pose.orientation.w = kf.q.w();
-        path.poses.push_back(pose);
-    }
-    pub_path.publish(path);
-}
-
-void PublishLoopEdges(const std::vector<LoopConstraint>& loops) {
-    visualization_msgs::Marker loop_line;
-    loop_line.header.frame_id = "map";
-    loop_line.header.stamp = ros::Time::now();
-    loop_line.ns = "loop_edges";
-    loop_line.id = 10;
-    loop_line.type = visualization_msgs::Marker::LINE_LIST;
-    loop_line.action = visualization_msgs::Marker::ADD;
-    loop_line.scale.x = 0.05;
-    loop_line.color.r = 0.0;
-    loop_line.color.g = 1.0;
-    loop_line.color.b = 1.0;
-    loop_line.color.a = 1.0;
-
-    for (const auto& loop : loops) {
+    for (size_t i = 1; i < keyframes.size(); ++i) {
         geometry_msgs::Point p1, p2;
-        p1.x = keyframes[loop.id_a].t.x();
-        p1.y = keyframes[loop.id_a].t.y();
-        p1.z = keyframes[loop.id_a].t.z();
-        p2.x = keyframes[loop.id_b].t.x();
-        p2.y = keyframes[loop.id_b].t.y();
-        p2.z = keyframes[loop.id_b].t.z();
-        loop_line.points.push_back(p1);
-        loop_line.points.push_back(p2);
+        p1.x = keyframes[i - 1].t.x();
+        p1.y = keyframes[i - 1].t.y();
+        p1.z = keyframes[i - 1].t.z();
+        p2.x = keyframes[i].t.x();
+        p2.y = keyframes[i].t.y();
+        p2.z = keyframes[i].t.z();
+        line_list.points.push_back(p1);
+        line_list.points.push_back(p2);
     }
+    pub_graph.publish(line_list);
 
-    pub_marker.publish(loop_line);
+
+    for (size_t i = 0; i < keyframes.size(); ++i) {
+        const auto& kf = keyframes[i];
+
+        visualization_msgs::Marker text;
+        text.header.frame_id = "map";
+        text.header.stamp = ros::Time::now();
+        text.ns = "keyframe_text";
+        text.id = i;
+        text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        text.action = visualization_msgs::Marker::ADD;
+        text.scale.z = 0.3;
+        text.color.r = 1.0;
+        text.color.g = 1.0;
+        text.color.b = 1.0;
+        text.color.a = 1.0;
+        text.pose.position.x = kf.t.x();
+        text.pose.position.y = kf.t.y();
+        text.pose.position.z = kf.t.z() + 0.3;
+        text.text = std::to_string(kf.id);
+        pub_graph.publish(text);
+
+        visualization_msgs::Marker sphere;
+        sphere.header.frame_id = "map";
+        sphere.header.stamp = ros::Time::now();
+        sphere.ns = "keyframe_sphere";
+        sphere.id = i;
+        sphere.type = visualization_msgs::Marker::SPHERE;
+        sphere.action = visualization_msgs::Marker::ADD;
+        sphere.pose.position.x = kf.t.x();
+        sphere.pose.position.y = kf.t.y();
+        sphere.pose.position.z = kf.t.z();
+        sphere.scale.x = 0.5;
+        sphere.scale.y = 0.5;
+        sphere.scale.z = 0.5;
+        sphere.color.r = 1.0;
+        sphere.color.g = 0.0;
+        sphere.color.b = 0.0;
+        sphere.color.a = 1.0;
+        pub_graph.publish(sphere);
+    }
 }
 
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "keyframe_loop_node");
+    ros::init(argc, argv, "keyframe_graph_node");
     ros::NodeHandle nh;
 
-    // 订阅关键帧话题
-    ros::Subscriber sub_kf_pose = nh.subscribe("/keyframe_pose", 100, KeyframePoseCallback);
-    ros::Subscriber sub_kf_cloud = nh.subscribe("/keyframe_cloud", 100, KeyframeCloudCallback);
+    ros::Publisher pub_graph = nh.advertise<visualization_msgs::Marker>("keyframe_graph", 1);
+    ros::Publisher pub_loop_edge = nh.advertise<visualization_msgs::Marker>("loop_edges", 1);
 
-    // 发布轨迹 Marker 和 Path
-    pub_marker = nh.advertise<visualization_msgs::Marker>("keyframe_graph", 10);
-    pub_path   = nh.advertise<nav_msgs::Path>("keyframe_path", 1);
+    std::string keyframe_file = result_path + "/keyframes.txt";
 
-    ros::Rate rate(1.0);  // 1Hz 可视化频率
-    static int last_detect_id = -100;
 
-    while (ros::ok()) {
-        ros::spinOnce();
-        PublishVisualization();
+    if (!LoadKeyframesFromFile(keyframe_file)) {
+        return -1;
+    }
 
-        if (!keyframes.empty() && keyframes.back().id - last_detect_id >= 5) {
-            last_detect_id = keyframes.back().id;
+    std::vector<LoopCandidate> loop_candidates;
+    DetectLoopCandidates(keyframes, loop_candidates);
 
-            std::vector<LoopCandidate> loop_candidates;
-            DetectLoopCandidates(keyframes, loop_candidates);
+    std::vector<LoopConstraint> loop_constraints;
+    for (const auto& loop : loop_candidates) {
+        std::string cloud_file_a = result_path + "/" + std::to_string(loop.id_a) + ".pcd";
+        std::string cloud_file_b = result_path + "/" + std::to_string(loop.id_b) + ".pcd";
 
-            std::vector<LoopConstraint> loop_constraints;
-            for (const auto& loop : loop_candidates) {
+        PointCloudT::Ptr cloud_a(new PointCloudT);
+        PointCloudT::Ptr cloud_b(new PointCloudT);
 
-                PointCloudPtr cloud_a = keyframes[loop.id_a].cloud;
-                PointCloudPtr cloud_b = keyframes[loop.id_b].cloud;
-
-                if (!cloud_a || !cloud_b || cloud_a->empty() || cloud_b->empty()) {
-                    ROS_WARN("Empty cloud for loop (%d, %d)", loop.id_a, loop.id_b);
-                    continue;
-                }
-
-                Eigen::Matrix4d T_refined;
-                double rmse;
-                if (GnAlignPoint2Plane(cloud_a, cloud_b, loop, T_refined, rmse)) {
-                    if (rmse < 0.5) {
-                        loop_constraints.emplace_back(loop.id_a, loop.id_b, T_refined, rmse);
-                    }
-                }
-            }
-
-            PublishLoopEdges(loop_constraints);
+        if (pcl::io::loadPCDFile(cloud_file_a, *cloud_a) == -1) {
+            std::cerr << "Failed to load " << cloud_file_a << std::endl;
+            continue;
+        }
+        if (pcl::io::loadPCDFile(cloud_file_b, *cloud_b) == -1) {
+            std::cerr << "Failed to load " << cloud_file_b << std::endl;
+            continue;
         }
 
+        Eigen::Matrix4d T_refined;
+        double rmse;
+        if (GnAlignPoint2Plane(cloud_a, cloud_b, loop, T_refined, rmse)) {
+            std::cout << "Loop detected between " << loop.id_a << " and " << loop.id_b << ", RMSE: " << rmse << std::endl;
+            if (rmse < 0.4) {
+                loop_constraints.emplace_back(loop.id_a, loop.id_b, T_refined, rmse);
+            }
+        } else {
+            std::cout << "Failed to align loop between " << loop.id_a << " and " << loop.id_b << std::endl;
+        }
+    }
+    std::cout << "Total loop constraints: " << loop_constraints.size() << std::endl;
+
+    // std::ofstream fout(result_path + "/loop_constraints.txt");
+    // for (const auto& c : loop_constraints) {
+    //     fout << c.id_a << " " << c.id_b << "\n";
+    //     fout << c.T_a_to_b << "\n";
+    //     fout << "rmse: " << c.rmse << "\n\n";
+    // }
+    // fout.close();
+
+    ros::Rate rate(1);  // 每秒发布一次
+    while (ros::ok()) {
+        PublishLoopEdges(pub_loop_edge, keyframes, loop_constraints);
+        PublishKeyframeGraph(pub_graph, keyframes);
+        ros::spinOnce();
         rate.sleep();
     }
 

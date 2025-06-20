@@ -15,15 +15,17 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
 
 using PointT = pcl::PointXYZ;
 using PointCloudT = pcl::PointCloud<PointT>;
 
 std::string result_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/pcl_kf_distance_1";
 
-double time_thresh = 10.0; 
-double distance_thresh = 30.0; 
-int min_id_interval = 20;
+double time_thresh = 30.0; 
+double distance_thresh = 25.0; 
+int min_id_interval = 50;
 int skip_id = 0;
 
 struct Keyframe {
@@ -36,7 +38,8 @@ struct Keyframe {
 std::vector<Keyframe> keyframes;
 
 struct LoopCandidate {
-    int id_a, id_b;
+    int id_a;
+    int id_b;
     Eigen::Matrix4d T_a_to_b;
 
     LoopCandidate(int a, int b, const Eigen::Matrix4d& T) : id_a(a), id_b(b), T_a_to_b(T) {}
@@ -51,6 +54,110 @@ struct LoopConstraint {
     LoopConstraint(int a, int b, const Eigen::Matrix4d& T, double e)
         : id_a(a), id_b(b), T_a_to_b(T), rmse(e) {}
 };
+
+// struct PoseGraphErrorTerm {
+//     PoseGraphErrorTerm(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij)
+//         : q_ij_(q_ij), t_ij_(t_ij) {}
+
+//     template <typename T>
+//     bool operator()(const T* const q_i, const T* const t_i, const T* const q_j, const T* const t_j, T* residuals) const {
+//         Eigen::Map<const Eigen::Quaternion<T>> Qi(q_i);
+//         Eigen::Map<const Eigen::Matrix<T, 3, 1>> Ti(t_i);
+        
+//         Eigen::Map<const Eigen::Quaternion<T>> Qj(q_j);
+//         Eigen::Map<const Eigen::Matrix<T, 3, 1>> Tj(t_j);
+
+//         Eigen::Quaternion<T> Qij_meas = q_ij_.cast<T>();
+//         Eigen::Matrix<T, 3, 1> Tij_meas = t_ij_.cast<T>();
+
+//         Eigen::Quaternion<T> Q_err = Qij_meas.inverse() * (Qi.inverse() * Qj);
+//         Eigen::Matrix<T, 3, 1> T_err = Qi.inverse() * (Tj - Ti) - Tij_meas;
+
+//         residuals[0] = T(2.0) * Q_err.x();
+//         residuals[1] = T(2.0) * Q_err.y();
+//         residuals[2] = T(2.0) * Q_err.z();
+//         residuals[3] = T_err.x();
+//         residuals[4] = T_err.y();
+//         residuals[5] = T_err.z();
+//         return true;
+//     }
+
+//     static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij) {
+//         return (new ceres::AutoDiffCostFunction<PoseGraphErrorTerm, 6, 4, 3, 4, 3>(
+//             new PoseGraphErrorTerm(q_ij, t_ij)));
+//     }
+
+//     Eigen::Quaterniond q_ij_;
+//     Eigen::Vector3d t_ij_;
+// };
+
+struct PoseGraphErrorTerm {
+    PoseGraphErrorTerm(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij)
+        : q_ij_(q_ij), t_ij_(t_ij) {}
+
+    bool operator()(const double* const q_i, const double* const t_i, const double* const q_j, const double* const t_j, double* residuals) const {
+        Eigen::Map<const Eigen::Quaterniond> Qi(q_i);
+        Eigen::Map<const Eigen::Vector3d> Ti(t_i);
+        
+        Eigen::Map<const Eigen::Quaterniond> Qj(q_j);
+        Eigen::Map<const Eigen::Vector3d> Tj(t_j);
+
+        Eigen::Quaterniond Qij_meas = q_ij_;
+        Eigen::Vector3d Tij_meas = t_ij_;
+
+        Eigen::Quaterniond Q_err = Qij_meas.inverse() * (Qi.inverse() * Qj);
+        Eigen::Vector3d T_err = Qi.inverse() * (Tj - Ti) - Tij_meas;
+
+        residuals[0] = 2.0 * Q_err.x();
+        residuals[1] = 2.0 * Q_err.y();
+        residuals[2] = 2.0 * Q_err.z();
+        residuals[3] = T_err.x();
+        residuals[4] = T_err.y();
+        residuals[5] = T_err.z();
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij) {
+        return (new ceres::NumericDiffCostFunction<PoseGraphErrorTerm, ceres::CENTRAL, 6, 4, 3, 4, 3>(
+            new PoseGraphErrorTerm(q_ij, t_ij)));
+    }
+
+    Eigen::Quaterniond q_ij_;
+    Eigen::Vector3d t_ij_;
+};
+
+void OptimizePoseGraph(std::map<int, Keyframe>& keyframes,
+                       const std::vector<std::pair<int, int>>& edges,
+                       const std::map<std::pair<int, int>, Eigen::Isometry3d>& relative_poses) {
+
+    ceres::Problem problem;
+    for (auto& kf : keyframes) {
+        problem.AddParameterBlock(kf.second.q.coeffs().data(), 4, new ceres::EigenQuaternionManifold());
+        problem.AddParameterBlock(kf.second.t.data(), 3);
+    }
+
+    // 固定第一个关键帧
+    problem.SetParameterBlockConstant(keyframes.begin()->second.q.coeffs().data());
+    problem.SetParameterBlockConstant(keyframes.begin()->second.t.data());
+
+    for (auto& edge : edges) {
+        const Eigen::Isometry3d& T = relative_poses.at(edge);
+        Eigen::Quaterniond q(T.rotation());
+        Eigen::Vector3d t = T.translation();
+
+        ceres::CostFunction* cost_function = PoseGraphErrorTerm::Create(q, t);
+        problem.AddResidualBlock(cost_function, nullptr,
+                                 keyframes[edge.first].q.coeffs().data(), keyframes[edge.first].t.data(),
+                                 keyframes[edge.second].q.coeffs().data(), keyframes[edge.second].t.data());
+    }
+
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.minimizer_progress_to_stdout = true;
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+    std::cout << summary.FullReport() << "\n";
+}
 
 Eigen::Matrix3d SkewSymmetric(const Eigen::Vector3d& v) {
     Eigen::Matrix3d m;
@@ -244,7 +351,6 @@ void PublishLoopEdges(ros::Publisher& pub_graph, const std::vector<Keyframe>& ke
     pub_graph.publish(loop_edge_marker);
 }
 
-
 void PublishKeyframeGraph(ros::Publisher& pub_graph, const std::vector<Keyframe>& keyframes) {
 
     visualization_msgs::Marker line_list;
@@ -361,6 +467,7 @@ int main(int argc, char** argv) {
             std::cout << "Failed to align loop between " << loop.id_a << " and " << loop.id_b << std::endl;
         }
     }
+    std::cout << "Total loop constraints: " << loop_constraints.size() << std::endl;
 
     std::ofstream fout(result_path + "/loop_constraints.txt");
     for (const auto& c : loop_constraints) {
@@ -369,6 +476,50 @@ int main(int argc, char** argv) {
         fout << "rmse: " << c.rmse << "\n\n";
     }
     fout.close();
+
+    std::vector<std::pair<int, int>> edges;
+    std::map<std::pair<int, int>, Eigen::Isometry3d> relative_poses;
+
+    for (size_t i = 1; i < keyframes.size(); ++i) {
+        const auto& kf1 = keyframes[i - 1];
+        const auto& kf2 = keyframes[i];
+
+        Eigen::Quaterniond dq = kf1.q.inverse() * kf2.q;
+        Eigen::Vector3d dt = kf1.q.inverse() * (kf2.t - kf1.t);
+        Eigen::Isometry3d T;
+        T.linear() = dq.toRotationMatrix();
+        T.translation() = dt;
+
+        edges.emplace_back(kf1.id, kf2.id);
+        relative_poses[{kf1.id, kf2.id}] = T;
+    }
+
+    for (const auto& loop : loop_constraints) {
+        Eigen::Isometry3d T(loop.T_a_to_b);
+        edges.emplace_back(loop.id_a, loop.id_b);
+        relative_poses[{loop.id_a, loop.id_b}] = T;
+    }
+
+    std::map<int, Keyframe> keyframes_map;
+    for (const auto& kf : keyframes) {
+        keyframes_map[kf.id] = kf;
+    }
+
+    OptimizePoseGraph(keyframes_map, edges, relative_poses);
+
+    // Step 4: 更新优化后的位姿回 keyframes 向量
+    for (auto& kf : keyframes) {
+        kf.q = keyframes_map[kf.id].q.normalized();
+        kf.t = keyframes_map[kf.id].t;
+    }
+
+    std::ofstream fout_opt(result_path + "/optimized_keyframes.txt");
+    for (const auto& kf : keyframes) {
+        fout_opt << kf.id << " " << kf.timestamp << " "
+                << kf.t.x() << " " << kf.t.y() << " " << kf.t.z() << " "
+                << kf.q.x() << " " << kf.q.y() << " " << kf.q.z() << " " << kf.q.w() << "\n";
+    }
+    fout_opt.close();
 
     ros::Rate rate(1);  // 每秒发布一次
     while (ros::ok()) {

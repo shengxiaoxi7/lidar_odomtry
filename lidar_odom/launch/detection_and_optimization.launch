@@ -1,0 +1,7 @@
+<!-- launch/lidar_odom.launch -->
+<launch>
+    <node pkg="lidar_odom" type="loop_detection_and_optimization" name="loop_detection_and_optimization" output="screen" />
+
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find lidar_odom)/rviz/rviz.rviz" />
+
+</launch>

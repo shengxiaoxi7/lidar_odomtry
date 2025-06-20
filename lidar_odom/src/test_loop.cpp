@@ -1,3 +1,4 @@
+// 该代码只用于在里程计节点中可视化关键帧图
 #include <ros/ros.h>
 #include <visualization_msgs/Marker.h>
 #include <geometry_msgs/Point.h>
@@ -100,46 +101,49 @@ void PublishVisualization() {
         line_list.points.push_back(p);
     }
     pub_marker.publish(line_list);
+   
+    for (const auto& kf : keyframes){
+        
+        // 3. 发布最新关键帧小球        
+        visualization_msgs::Marker sphere;
+        sphere.header.frame_id = "map";
+        sphere.header.stamp = stamp;
+        sphere.ns = "keyframe_sphere";
+        sphere.id = kf.id;
+        sphere.type = visualization_msgs::Marker::SPHERE;
+        sphere.action = visualization_msgs::Marker::ADD;
+        sphere.pose.position.x = kf.t.x();
+        sphere.pose.position.y = kf.t.y();
+        sphere.pose.position.z = kf.t.z();
+        sphere.scale.x = 0.2;
+        sphere.scale.y = 0.2;
+        sphere.scale.z = 0.2;
+        sphere.color.r = 1.0;
+        sphere.color.g = 0.0;
+        sphere.color.b = 0.0;
+        sphere.color.a = 1.0;
+        pub_marker.publish(sphere);
 
-    // 3. 发布最新关键帧小球
-    const auto& kf = keyframes.back();
-    visualization_msgs::Marker sphere;
-    sphere.header.frame_id = "map";
-    sphere.header.stamp = stamp;
-    sphere.ns = "keyframe_sphere";
-    sphere.id = 1;
-    sphere.type = visualization_msgs::Marker::SPHERE;
-    sphere.action = visualization_msgs::Marker::ADD;
-    sphere.pose.position.x = kf.t.x();
-    sphere.pose.position.y = kf.t.y();
-    sphere.pose.position.z = kf.t.z();
-    sphere.scale.x = 0.2;
-    sphere.scale.y = 0.2;
-    sphere.scale.z = 0.2;
-    sphere.color.r = 1.0;
-    sphere.color.g = 0.0;
-    sphere.color.b = 0.0;
-    sphere.color.a = 1.0;
-    pub_marker.publish(sphere);
+        // 4. 发布文字标签
+        visualization_msgs::Marker text;
+        text.header.frame_id = "map";
+        text.header.stamp = stamp;
+        text.ns = "keyframe_text";
+        text.id = kf.id;
+        text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        text.action = visualization_msgs::Marker::ADD;
+        text.pose.position.x = kf.t.x();
+        text.pose.position.y = kf.t.y();
+        text.pose.position.z = kf.t.z() + 0.3;
+        text.scale.z = 0.3;
+        text.color.r = 1.0;
+        text.color.g = 1.0;
+        text.color.b = 1.0;
+        text.color.a = 1.0;
+        text.text = std::to_string(kf.id);
+        pub_marker.publish(text);        
+    }
 
-    // 4. 发布文字标签
-    visualization_msgs::Marker text;
-    text.header.frame_id = "map";
-    text.header.stamp = stamp;
-    text.ns = "keyframe_text";
-    text.id = 2;
-    text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-    text.action = visualization_msgs::Marker::ADD;
-    text.pose.position.x = kf.t.x();
-    text.pose.position.y = kf.t.y();
-    text.pose.position.z = kf.t.z() + 0.3;
-    text.scale.z = 0.3;
-    text.color.r = 1.0;
-    text.color.g = 1.0;
-    text.color.b = 1.0;
-    text.color.a = 1.0;
-    text.text = std::to_string(kf.id);
-    pub_marker.publish(text);
 
     // 5. 发布 Path 消息（用于轨迹线）
     nav_msgs::Path path;

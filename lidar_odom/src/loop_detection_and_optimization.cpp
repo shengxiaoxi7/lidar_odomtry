@@ -55,110 +55,6 @@ struct LoopConstraint {
         : id_a(a), id_b(b), T_a_to_b(T), rmse(e) {}
 };
 
-// struct PoseGraphErrorTerm {
-//     PoseGraphErrorTerm(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij)
-//         : q_ij_(q_ij), t_ij_(t_ij) {}
-
-//     template <typename T>
-//     bool operator()(const T* const q_i, const T* const t_i, const T* const q_j, const T* const t_j, T* residuals) const {
-//         Eigen::Map<const Eigen::Quaternion<T>> Qi(q_i);
-//         Eigen::Map<const Eigen::Matrix<T, 3, 1>> Ti(t_i);
-        
-//         Eigen::Map<const Eigen::Quaternion<T>> Qj(q_j);
-//         Eigen::Map<const Eigen::Matrix<T, 3, 1>> Tj(t_j);
-
-//         Eigen::Quaternion<T> Qij_meas = q_ij_.cast<T>();
-//         Eigen::Matrix<T, 3, 1> Tij_meas = t_ij_.cast<T>();
-
-//         Eigen::Quaternion<T> Q_err = Qij_meas.inverse() * (Qi.inverse() * Qj);
-//         Eigen::Matrix<T, 3, 1> T_err = Qi.inverse() * (Tj - Ti) - Tij_meas;
-
-//         residuals[0] = T(2.0) * Q_err.x();
-//         residuals[1] = T(2.0) * Q_err.y();
-//         residuals[2] = T(2.0) * Q_err.z();
-//         residuals[3] = T_err.x();
-//         residuals[4] = T_err.y();
-//         residuals[5] = T_err.z();
-//         return true;
-//     }
-
-//     static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij) {
-//         return (new ceres::AutoDiffCostFunction<PoseGraphErrorTerm, 6, 4, 3, 4, 3>(
-//             new PoseGraphErrorTerm(q_ij, t_ij)));
-//     }
-
-//     Eigen::Quaterniond q_ij_;
-//     Eigen::Vector3d t_ij_;
-// };
-
-struct PoseGraphErrorTerm {
-    PoseGraphErrorTerm(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij)
-        : q_ij_(q_ij), t_ij_(t_ij) {}
-
-    bool operator()(const double* const q_i, const double* const t_i, const double* const q_j, const double* const t_j, double* residuals) const {
-        Eigen::Map<const Eigen::Quaterniond> Qi(q_i);
-        Eigen::Map<const Eigen::Vector3d> Ti(t_i);
-        
-        Eigen::Map<const Eigen::Quaterniond> Qj(q_j);
-        Eigen::Map<const Eigen::Vector3d> Tj(t_j);
-
-        Eigen::Quaterniond Qij_meas = q_ij_;
-        Eigen::Vector3d Tij_meas = t_ij_;
-
-        Eigen::Quaterniond Q_err = Qij_meas.inverse() * (Qi.inverse() * Qj);
-        Eigen::Vector3d T_err = Qi.inverse() * (Tj - Ti) - Tij_meas;
-
-        residuals[0] = 2.0 * Q_err.x();
-        residuals[1] = 2.0 * Q_err.y();
-        residuals[2] = 2.0 * Q_err.z();
-        residuals[3] = T_err.x();
-        residuals[4] = T_err.y();
-        residuals[5] = T_err.z();
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij) {
-        return (new ceres::NumericDiffCostFunction<PoseGraphErrorTerm, ceres::CENTRAL, 6, 4, 3, 4, 3>(
-            new PoseGraphErrorTerm(q_ij, t_ij)));
-    }
-
-    Eigen::Quaterniond q_ij_;
-    Eigen::Vector3d t_ij_;
-};
-
-void OptimizePoseGraph(std::map<int, Keyframe>& keyframes,
-                       const std::vector<std::pair<int, int>>& edges,
-                       const std::map<std::pair<int, int>, Eigen::Isometry3d>& relative_poses) {
-
-    ceres::Problem problem;
-    for (auto& kf : keyframes) {
-        problem.AddParameterBlock(kf.second.q.coeffs().data(), 4, new ceres::EigenQuaternionManifold());
-        problem.AddParameterBlock(kf.second.t.data(), 3);
-    }
-
-    // 固定第一个关键帧
-    problem.SetParameterBlockConstant(keyframes.begin()->second.q.coeffs().data());
-    problem.SetParameterBlockConstant(keyframes.begin()->second.t.data());
-
-    for (auto& edge : edges) {
-        const Eigen::Isometry3d& T = relative_poses.at(edge);
-        Eigen::Quaterniond q(T.rotation());
-        Eigen::Vector3d t = T.translation();
-
-        ceres::CostFunction* cost_function = PoseGraphErrorTerm::Create(q, t);
-        problem.AddResidualBlock(cost_function, nullptr,
-                                 keyframes[edge.first].q.coeffs().data(), keyframes[edge.first].t.data(),
-                                 keyframes[edge.second].q.coeffs().data(), keyframes[edge.second].t.data());
-    }
-
-    ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.minimizer_progress_to_stdout = true;
-    ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
-    std::cout << summary.FullReport() << "\n";
-}
-
 Eigen::Matrix3d SkewSymmetric(const Eigen::Vector3d& v) {
     Eigen::Matrix3d m;
     m << 0, -v.z(), v.y(),
@@ -177,6 +73,265 @@ Eigen::Matrix3d ExpSO3(const Eigen::Vector3d& omega) {
     Eigen::Matrix3d axis_skew = SkewSymmetric(axis);
 
     return Eigen::Matrix3d::Identity() + std::sin(theta) * axis_skew + (1 - std::cos(theta)) * axis_skew * axis_skew;
+}
+
+Eigen::Vector3d LogSO3(const Eigen::Matrix3d& R) {
+    double cos_theta = (R.trace() - 1) / 2.0;
+    cos_theta = std::min(std::max(cos_theta, -1.0), 1.0);
+    double theta = std::acos(cos_theta);
+    if (theta < 1e-10) return Eigen::Vector3d::Zero();
+    Eigen::Vector3d omega;
+    omega << R(2, 1) - R(1, 2),
+             R(0, 2) - R(2, 0),
+             R(1, 0) - R(0, 1);
+    return theta / (2 * std::sin(theta)) * omega;
+}
+
+struct PoseGraphErrorTerm {
+    PoseGraphErrorTerm(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij)
+        : q_ij_(q_ij), t_ij_(t_ij) {}
+
+    template <typename T>
+    bool operator()(const T* const q_i, const T* const t_i, const T* const q_j, const T* const t_j, T* residuals) const {
+        Eigen::Map<const Eigen::Quaternion<T>> Qi(q_i);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> Ti(t_i);
+        
+        Eigen::Map<const Eigen::Quaternion<T>> Qj(q_j);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> Tj(t_j);
+
+        Eigen::Quaternion<T> Qij_meas = q_ij_.cast<T>();
+        Eigen::Matrix<T, 3, 1> Tij_meas = t_ij_.cast<T>();
+
+        Eigen::Quaternion<T> Q_err = Qij_meas.inverse() * (Qi.inverse() * Qj);
+        Eigen::Matrix<T, 3, 1> T_err = Qi.inverse() * (Tj - Ti) - Tij_meas;
+
+        residuals[0] = T(2.0) * Q_err.x();
+        residuals[1] = T(2.0) * Q_err.y();
+        residuals[2] = T(2.0) * Q_err.z();
+        residuals[3] = T_err.x();
+        residuals[4] = T_err.y();
+        residuals[5] = T_err.z();
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij) {
+        return (new ceres::AutoDiffCostFunction<PoseGraphErrorTerm, 6, 4, 3, 4, 3>(
+            new PoseGraphErrorTerm(q_ij, t_ij)));
+    }
+
+    Eigen::Quaterniond q_ij_;
+    Eigen::Vector3d t_ij_;
+};
+
+
+class PoseGraphErrorAnalytic_Quaternion : public ceres::SizedCostFunction<6, 4, 3, 4, 3> {
+public:
+    PoseGraphErrorAnalytic_Quaternion(const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij)
+        : q_ij_(q_ij), t_ij_(t_ij) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                          double* residuals,
+                          double** jacobians) const override {
+        using T = double;
+
+        Eigen::Map<const Eigen::Quaternion<T>> Qi(parameters[0]);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> Ti(parameters[1]);
+        Eigen::Map<const Eigen::Quaternion<T>> Qj(parameters[2]);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> Tj(parameters[3]);
+
+        Eigen::Quaternion<T> Qij_meas = q_ij_.cast<T>();
+        Eigen::Matrix<T, 3, 1> Tij_meas = t_ij_.cast<T>();
+
+        Eigen::Quaternion<T> Q_err = Qij_meas.conjugate() * (Qi.conjugate() * Qj);
+        Eigen::Matrix<T, 3, 1> T_err = (Qi.conjugate() * (Tj - Ti)) - Tij_meas;
+
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residual_vec(residuals);
+        residual_vec.template head<3>() = 2.0 * Q_err.vec();  // 虚部残差
+        residual_vec.template tail<3>() = T_err;
+
+        if (jacobians) {
+            // Q_err = Qij⁻¹ × Qi⁻¹ × Qj
+            const Eigen::Matrix<T, 3, 1> dt = Tj - Ti;
+
+            // Qi⁻¹
+            Eigen::Quaternion<T> Qi_inv = Qi.conjugate();
+            Eigen::Quaternion<T> Qij_inv = Qij_meas.conjugate();
+
+            // Q_mid = Qi⁻¹ × Qj
+            Eigen::Quaternion<T> Q_mid = Qi_inv * Qj;
+            Eigen::Quaternion<T> Qe = Qij_inv * Q_mid;
+
+            auto LeftQuatMatrix = [](const Eigen::Quaternion<T>& q) {
+                Eigen::Matrix<T, 4, 4> m;
+                m << q.w(), -q.x(), -q.y(), -q.z(),
+                     q.x(),  q.w(), -q.z(),  q.y(),
+                     q.y(),  q.z(),  q.w(), -q.x(),
+                     q.z(), -q.y(),  q.x(),  q.w();
+                return m;
+            };
+
+            auto RightQuatMatrix = [](const Eigen::Quaternion<T>& q) {
+                Eigen::Matrix<T, 4, 4> m;
+                m << q.w(), -q.x(), -q.y(), -q.z(),
+                     q.x(),  q.w(),  q.z(), -q.y(),
+                     q.y(), -q.z(),  q.w(),  q.x(),
+                     q.z(),  q.y(), -q.x(),  q.w();
+                return m;
+            };
+
+            if (jacobians[0]) {
+                // ∂Qe / ∂Qi ≈ Qij⁻¹ * ∂(Qi⁻¹ * Qj) / ∂Qi
+                // d(Qi⁻¹) ≈ -0.5 * Left(Qi) * dθ
+                Eigen::Matrix<T, 4, 4> dQe_dQi = LeftQuatMatrix(Qij_inv) * RightQuatMatrix(Qj) * (-0.5);
+                Eigen::Matrix<T, 3, 4> Jr_qi = 2.0 * dQe_dQi.block(1, 0, 3, 4); 
+                Eigen::Map<Eigen::Matrix<T, 6, 4, Eigen::RowMajor>> J_qi(jacobians[0]);
+                J_qi.setZero();
+                J_qi.topRows<3>() = Jr_qi;
+
+                Eigen::Matrix<T, 3, 3> dt_hat;
+                dt_hat <<     0, -dt.z(),  dt.y(),
+                          dt.z(),     0, -dt.x(),
+                         -dt.y(),  dt.x(),     0;
+                Eigen::Matrix<T, 3, 3> R_i = Qi.toRotationMatrix();
+                J_qi.bottomLeftCorner<3, 3>() = -R_i.transpose() * dt_hat * 0.5;
+            }
+
+            if (jacobians[1]) {
+                Eigen::Map<Eigen::Matrix<T, 6, 3, Eigen::RowMajor>> J_ti(jacobians[1]);
+                J_ti.setZero();
+                Eigen::Matrix<T, 3, 3> R_i = Qi.toRotationMatrix();
+                J_ti.bottomRows<3>() = -R_i.transpose();
+            }
+
+            if (jacobians[2]) {
+                Eigen::Matrix<T, 4, 4> dQe_dQj = LeftQuatMatrix(Qij_inv * Qi_inv) * 0.5;
+                Eigen::Matrix<T, 3, 4> Jr_qj = 2.0 * dQe_dQj.block(1, 0, 3, 4);
+                Eigen::Map<Eigen::Matrix<T, 6, 4, Eigen::RowMajor>> J_qj(jacobians[2]);
+                J_qj.setZero();
+                J_qj.topRows<3>() = Jr_qj;
+
+            }
+
+            if (jacobians[3]) {
+                Eigen::Map<Eigen::Matrix<T, 6, 3, Eigen::RowMajor>> J_tj(jacobians[3]);
+                J_tj.setZero();
+                Eigen::Matrix<T, 3, 3> R_i = Qi.toRotationMatrix();
+                J_tj.bottomRows<3>() = R_i.transpose();
+            }
+        }
+
+        return true;
+    }
+
+private:
+    Eigen::Quaterniond q_ij_;
+    Eigen::Vector3d t_ij_;
+};
+
+class PoseGraphError_SO3 : public ceres::SizedCostFunction<6, 9, 3, 9, 3> {
+public:
+    PoseGraphError_SO3(const Eigen::Quaterniond& R_ij, const Eigen::Vector3d& t_ij)
+        : R_ij_(R_ij), t_ij_(t_ij) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                          double* residuals,
+                          double** jacobians) const override {
+        using namespace Eigen;
+        using T = double;
+        Map<const Matrix<T, 3, 3, RowMajor>> R_i(parameters[0]);
+        Map<const Matrix<T, 3, 1>> t_i(parameters[1]);
+        Map<const Matrix<T, 3, 3, RowMajor>> R_j(parameters[2]);
+        Map<const Matrix<T, 3, 1>> t_j(parameters[3]);
+
+        Eigen::Matrix3d R_err = R_ij_.transpose() * R_i.transpose() * R_j;
+        Eigen::Vector3d r_rot = LogSO3(R_err);
+        Eigen::Vector3d r_trans = R_i.transpose() * (t_j - t_i) - t_ij_;
+
+        Eigen::Map<Eigen::Matrix<double, 6, 1>> res(residuals);
+        res.head<3>() = r_rot;
+        res.tail<3>() = r_trans;
+
+        if (jacobians) {
+            Eigen::Matrix3d R_i_T = R_i.transpose();
+            Eigen::Matrix3d R_rel = R_i_T * R_j;
+            Eigen::Vector3d dt = t_j - t_i;
+
+            if (jacobians[0]) {
+                // dlog(R_err)/dq_i = - Ad(R_rel) ⋅ d(R_i)/dq_i
+                Eigen::Matrix3d Jr_rot = -R_rel;
+
+                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_qi(jacobians[0]);
+                J_qi.setZero();
+                Eigen::Matrix3d dt_hat = SkewSymmetric(dt);
+                J_qi.bottomLeftCorner<3, 3>() = -R_i_T * dt_hat;
+            }
+
+            if (jacobians[1]) {
+                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_ti(jacobians[1]);
+                J_ti.setZero();
+                J_ti.bottomRows<3>() = - R_i_T;
+            }
+
+            if (jacobians[2]) {
+                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_qj(jacobians[2]);
+                J_qj.setZero();
+                J_qj.topRows<3>() = Eigen::Matrix3d::Identity();
+            }
+
+            if (jacobians[3]) {
+                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_tj(jacobians[3]);
+                J_tj.setZero();
+                J_tj.bottomRows<3>() = R_i_T;
+            }
+        }
+
+        return true;
+    }
+
+private:
+    Eigen::Matrix3d R_ij_;
+    Eigen::Vector3d t_ij_;
+};
+
+// ceres::CostFunction* cost = new PoseGraphError_QuatInput_SO3Residual(q_ij, t_ij);
+// problem.AddResidualBlock(cost, nullptr, q_i, t_i, q_j, t_j);
+
+// problem.SetParameterization(q_i, new ceres::QuaternionParameterization());
+// problem.SetParameterization(q_j, new ceres::QuaternionParameterization());
+
+
+void OptimizePoseGraph(std::map<int, Keyframe>& keyframes,
+                       const std::vector<std::pair<int, int>>& edges,
+                       const std::map<std::pair<int, int>, Eigen::Isometry3d>& relative_poses) {
+
+    ceres::Problem problem;
+    for (auto& kf : keyframes) {
+        problem.AddParameterBlock(kf.second.q.coeffs().data(), 4, new ceres::EigenQuaternionManifold());//满足四元数的单位化约束，模长 = 1
+        problem.AddParameterBlock(kf.second.t.data(), 3);// .data()表示Eigen格式读取，取出其底层 double* 指针
+    }
+
+    // 固定第一个关键帧
+    problem.SetParameterBlockConstant(keyframes.begin()->second.q.coeffs().data());
+    problem.SetParameterBlockConstant(keyframes.begin()->second.t.data());
+
+    for (auto& edge : edges) {
+        const Eigen::Isometry3d& T = relative_poses.at(edge);
+        Eigen::Quaterniond q(T.rotation());
+        Eigen::Vector3d t = T.translation();
+
+        // ceres::CostFunction* cost_function = PoseGraphErrorTerm::Create(q, t);
+        ceres::CostFunction* cost_function = new PoseGraphErrorAnalytic_Quaternion(q, t);
+        problem.AddResidualBlock(cost_function, nullptr,
+                                 keyframes[edge.first].q.coeffs().data(), keyframes[edge.first].t.data(),
+                                 keyframes[edge.second].q.coeffs().data(), keyframes[edge.second].t.data()); // nullptr 是 loss function
+    }
+
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.minimizer_progress_to_stdout = true;
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+    std::cout << summary.FullReport() << "\n";
 }
 
 // 读取关键帧位姿

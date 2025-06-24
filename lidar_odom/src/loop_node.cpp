@@ -22,12 +22,12 @@
 using PointT = pcl::PointXYZ;
 using PointCloudT = pcl::PointCloud<PointT>;
 
-std::string result_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/pcl_kf_distance_1";
+std::string result_path = "/home/syx/my_lio/lidar_odom_ws/src/lidar_odom/tmp/car";
 
 double time_thresh = 30.0; 
 double distance_thresh = 25.0; 
 int min_id_interval = 50;
-int skip_id = 0;
+int skip_id = 50;
 
 struct Keyframe {
     int id;

@@ -321,9 +321,7 @@ Visualization Manager:
       Marker Topic: /keyframe_graph
       Name: Marker
       Namespaces:
-        keyframe_graph: true
-        keyframe_sphere: true
-        keyframe_text: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -331,7 +329,7 @@ Visualization Manager:
       Marker Topic: /loop_edges
       Name: Marker
       Namespaces:
-        loop_edges: true
+        {}
       Queue Size: 100
       Value: true
   Enabled: true

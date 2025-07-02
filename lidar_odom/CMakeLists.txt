@@ -13,7 +13,9 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_conversions
 )
 
+find_package(Ceres NO_DEFAULT_PATH PATHS /home/syx/software/ceres-solver-2.2.0/install)
 find_package(Ceres REQUIRED)
+
 find_package(PCL REQUIRED)
 
 catkin_package(
@@ -48,3 +50,8 @@ target_link_libraries(loop_node ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIB
 add_executable(loop_visualization src/loop_visualization.cpp)
 target_link_libraries(loop_visualization ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
 
+add_executable(direct_optimization src/direct_optimization.cpp)
+target_link_libraries(direct_optimization ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})
+
+add_executable(direct_optimization6 src/direct_optimization6.cpp)
+target_link_libraries(direct_optimization6 ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${PCL_LIBRARIES})

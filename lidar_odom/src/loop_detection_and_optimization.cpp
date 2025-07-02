@@ -90,17 +90,46 @@ Eigen::Vector3d LogSO3(const Eigen::Matrix3d& R) {
 }
 
 Eigen::Vector3d LogSO3_q(const Eigen::Quaterniond& q) {
-    Eigen::Vector3d omega;
-    double cos_theta = q.w();
-    double sin_theta = q.vec().norm();
-    double theta = 2.0 * std::atan2(sin_theta, cos_theta);
+    Eigen::Quaterniond q_norm = q.normalized();
+    double w = q_norm.w();
+    Eigen::Vector3d v = q_norm.vec();
 
-    if (sin_theta > 1e-5) {
-        omega = theta * q.vec().normalized();
+    double norm_v = v.norm();
+    double theta = 2.0 * atan2(norm_v, w);
+
+    if (norm_v < 1e-10) {
+        return Eigen::Vector3d::Zero();
     } else {
-        omega = 2.0 * q.vec();  // 小角度近似
+        return theta * v.normalized();
     }
-    return omega;
+}
+
+Eigen::Matrix<double,3,4> LiftJacobian(const Eigen::Quaterniond& q) {
+
+    Eigen::Matrix<double,4,3> Jtmp;
+    const double w = q.w();
+    const Eigen::Vector3d v = q.vec();
+
+    Jtmp.block<1,3>(0,0) = -0.5 * v.transpose();
+    Jtmp.block<3,3>(1,0) = 0.5 * (w * Eigen::Matrix3d::Identity() + SkewSymmetric(v));
+
+    return Jtmp.transpose();
+}
+Matrix3d RightJacobian(const Vector3d& phi) {
+    double theta = phi.norm();
+    Matrix3d I = Matrix3d::Identity();
+    Matrix3d phi_hat = SkewSymmetric(phi);
+
+    if (theta < 1e-4) {
+        return I - 0.5 * phi_hat + (1.0 / 6.0) * phi_hat * phi_hat;
+    }
+
+    double theta2 = theta * theta;
+    double sin_theta = sin(theta);
+    double cos_theta = cos(theta);
+
+    return I - (1.0 - cos_theta) / theta2 * phi_hat
+             + (theta - sin_theta) / (theta2 * theta) * phi_hat * phi_hat;
 }
 
 struct PoseGraphErrorTerm {
@@ -237,11 +266,15 @@ public:
                 J_qi.setZero();
 
                 Eigen::Matrix<T, 3, 4> J_lift_qi = LiftJacobian(qi);
-                J_qi.topRows<3>() = - RightJacobian(r_rot).inverse() * Rj.inverse() * Ri * J_lift_qi;
+                J_qi.topRows<3>() = - RightJacobian(r_rot).inverse() * Rj.inverse() * J_lift_qi;
 
                 Eigen::Matrix<T, 3, 3> dt_hat = SkewSymmetric(dt);
                 Eigen::Matrix<T, 3, 4> trans_jacobian = -Ri.inverse() * dt_hat * J_lift_qi;
                 J_qi.bottomRows<3>() = trans_jacobian;
+
+                // Eigen::Vector3d r_trans = Ri.inverse() * dt;
+                // Eigen::Matrix<T, 3, 4> r_trans_hat = SkewSymmetric(r_trans) * J_lift_qi;
+                // J_qi.bottomRows<3>() = r_trans_hat;
             }
 
             if (jacobians[1]) {
@@ -334,71 +367,6 @@ private:
     Eigen::Vector3d t_ij_;
 };
 
-class PoseGraphError_SO3 : public ceres::SizedCostFunction<6, 9, 3, 9, 3> {
-public:
-    PoseGraphError_SO3(const Eigen::Quaterniond& R_ij, const Eigen::Vector3d& t_ij)
-        : R_ij_(R_ij), t_ij_(t_ij) {}
-
-    virtual bool Evaluate(double const* const* parameters,
-                          double* residuals,
-                          double** jacobians) const override {
-        using namespace Eigen;
-        using T = double;
-        Map<const Matrix<T, 3, 3, RowMajor>> R_i(parameters[0]);
-        Map<const Matrix<T, 3, 1>> t_i(parameters[1]);
-        Map<const Matrix<T, 3, 3, RowMajor>> R_j(parameters[2]);
-        Map<const Matrix<T, 3, 1>> t_j(parameters[3]);
-
-        Eigen::Matrix3d R_err = R_ij_.transpose() * R_i.transpose() * R_j;
-        Eigen::Vector3d r_rot = LogSO3(R_err);
-        Eigen::Vector3d r_trans = R_i.transpose() * (t_j - t_i) - t_ij_;
-
-        Eigen::Map<Eigen::Matrix<double, 6, 1>> res(residuals);
-        res.head<3>() = r_rot;
-        res.tail<3>() = r_trans;
-
-        if (jacobians) {
-            Eigen::Matrix3d R_i_T = R_i.transpose();
-            Eigen::Matrix3d R_rel = R_i_T * R_j;
-            Eigen::Vector3d dt = t_j - t_i;
-
-            if (jacobians[0]) {
-                // dlog(R_err)/dq_i = - Ad(R_rel) ⋅ d(R_i)/dq_i
-                Eigen::Matrix3d Jr_rot = -R_rel;
-
-                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_qi(jacobians[0]);
-                J_qi.setZero();
-                Eigen::Matrix3d dt_hat = SkewSymmetric(dt);
-                J_qi.bottomLeftCorner<3, 3>() = -R_i_T * dt_hat;
-            }
-
-            if (jacobians[1]) {
-                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_ti(jacobians[1]);
-                J_ti.setZero();
-                J_ti.bottomRows<3>() = - R_i_T;
-            }
-
-            if (jacobians[2]) {
-                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_qj(jacobians[2]);
-                J_qj.setZero();
-                J_qj.topRows<3>() = Eigen::Matrix3d::Identity();
-            }
-
-            if (jacobians[3]) {
-                Eigen::Map<Eigen::Matrix<double, 6, 3, Eigen::RowMajor>> J_tj(jacobians[3]);
-                J_tj.setZero();
-                J_tj.bottomRows<3>() = R_i_T;
-            }
-        }
-
-        return true;
-    }
-
-private:
-    Eigen::Matrix3d R_ij_;
-    Eigen::Vector3d t_ij_;
-};
-
 // ceres::CostFunction* cost = new PoseGraphError_QuatInput_SO3Residual(q_ij, t_ij);
 // problem.AddResidualBlock(cost, nullptr, q_i, t_i, q_j, t_j);
 
@@ -413,6 +381,7 @@ void OptimizePoseGraph(std::map<int, Keyframe>& keyframes,
     ceres::Problem problem;
     for (auto& kf : keyframes) {
         problem.AddParameterBlock(kf.second.q.coeffs().data(), 4, new ceres::EigenQuaternionManifold());//满足四元数的单位化约束，模长 = 1
+        
         problem.AddParameterBlock(kf.second.t.data(), 3);// .data()表示Eigen格式读取，取出其底层 double* 指针
     }
 

@@ -1,0 +1,7 @@
+<!-- launch/lidar_odom.launch -->
+<launch>
+    <node pkg="lidar_odom" type="direct_optimization" name="direct_optimization" output="screen" />
+
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find lidar_odom)/rviz/rviz.rviz" />
+
+</launch>
